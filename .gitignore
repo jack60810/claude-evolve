@@ -1,0 +1,5 @@
+node_modules/
+learning/data/
+*.tmp
+.env
+.DS_Store

@@ -1,0 +1,81 @@
+{
+  "version": 2,
+  "genes": [
+    {
+      "type": "Gene",
+      "id": "gene_learn_query_patterns",
+      "category": "learn",
+      "signals_match": [
+        "db_query",
+        "bq_dry_run",
+        "amplitude_query",
+        "sql_pattern"
+      ],
+      "preconditions": [
+        "session contains database or MCP tool execution"
+      ],
+      "strategy": [
+        "Track which tables are queried most frequently",
+        "Record cost thresholds and dry-run habits",
+        "Note preferred data sources and query patterns",
+        "Capture common WHERE filters and date range patterns"
+      ]
+    },
+    {
+      "type": "Gene",
+      "id": "gene_learn_analysis_methodology",
+      "category": "learn",
+      "signals_match": [
+        "analysis_correction",
+        "methodology_feedback",
+        "sanity_check_failure"
+      ],
+      "preconditions": [
+        "user corrected analysis approach or methodology"
+      ],
+      "strategy": [
+        "Record the correction: what was wrong and what is correct",
+        "Update analysis principles (base definition, metric logic)",
+        "Track which mistakes recur to prioritize reminders"
+      ]
+    },
+    {
+      "type": "Gene",
+      "id": "gene_learn_tool_preferences",
+      "category": "learn",
+      "signals_match": [
+        "tool_usage_pattern",
+        "tool_sequence",
+        "mcp_tool_usage"
+      ],
+      "preconditions": [
+        "enough tool usage data to detect patterns"
+      ],
+      "strategy": [
+        "Count tool frequency per project type",
+        "Detect common tool sequences (e.g., Read -> Edit -> Bash)",
+        "Note when user prefers one tool over another",
+        "Track MCP tool usage patterns"
+      ]
+    },
+    {
+      "type": "Gene",
+      "id": "gene_learn_communication_style",
+      "category": "learn",
+      "signals_match": [
+        "format_correction",
+        "style_feedback",
+        "language_preference"
+      ],
+      "preconditions": [
+        "user gave feedback on output format or communication style"
+      ],
+      "strategy": [
+        "Track language switching patterns (zh-TW vs en)",
+        "Record format preferences (bullet points, no headers, etc.)",
+        "Note writing style rules (no em dashes, conversational tone)",
+        "Capture confirmed vs rejected output approaches"
+      ]
+    }
+  ]
+}

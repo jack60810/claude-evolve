@@ -1,0 +1,17 @@
+{
+  "name": "claude-evolve",
+  "version": "0.1.0",
+  "description": "Self-evolving learning system for Claude Code — learns from your corrections and behavior patterns, auto-writes rules to CLAUDE.md",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "ai",
+    "learning",
+    "evolution",
+    "automation"
+  ]
+}
