@@ -100,21 +100,26 @@ function askClaude(prompt, timeoutMs, tier) {
   }
 }
 
+// Minimum timeout per tier (CLI startup takes 5-10s)
+const MIN_TIMEOUT = { fast: 30000, smart: 45000 };
+
 /**
- * Call askClaude with a retry (some calls fail due to rate limits).
- * @param {string} prompt
- * @param {number} timeoutMs
- * @param {string} tier - 'fast' or 'smart'
- * @param {number} retries - number of retries (default 1)
+ * Call askClaude with retry and exponential backoff.
+ * Enforces minimum timeout per tier to account for CLI startup overhead.
  */
 function askClaudeWithRetry(prompt, timeoutMs, tier, retries) {
+  const effectiveTier = tier || 'fast';
+  const effectiveTimeout = Math.max(timeoutMs || 30000, MIN_TIMEOUT[effectiveTier] || 30000);
   const maxRetries = retries || 1;
+
   for (let i = 0; i <= maxRetries; i++) {
-    const result = askClaude(prompt, timeoutMs, tier);
+    const result = askClaude(prompt, effectiveTimeout, effectiveTier);
     if (result !== null) return result;
     if (i < maxRetries) {
+      // Exponential backoff: 3s, 6s, 12s...
+      const backoff = 3000 * Math.pow(2, i);
       const { spawnSync } = require('child_process');
-      spawnSync('sleep', ['2'], { timeout: 5000 });
+      spawnSync('sleep', [String(backoff / 1000)], { timeout: backoff + 2000 });
     }
   }
   return null;
