@@ -1,18 +1,19 @@
 #!/usr/bin/env node
-// processRules.js — Background processor for LLM-powered rule learning
-// Spawned by session-end.js as a detached process.
+// processRules.js — Genetic Algorithm pipeline for rule evolution
 //
-// Full pipeline:
-//   1. Strategy selection (repair/reinforce/explore/distill)
-//   2. Correction-based rule creation
-//   3. Fitness evaluation
-//   4a. Observation-based pattern analysis (from full tool call records)
-//   4b. Legacy behavior pattern analysis (fallback)
-//   5. Pruning
-//   6. Distillation
-//   7. Reflection (every 5 sessions)
-//   8. Compress observations → session memory .md + narrative
-//   9. Write CLAUDE.md + changelog
+// Per-session:
+//   1. Birth new rules from corrections + observations (as candidates)
+//   2. Relevance-aware fitness scoring (LLM evaluates each active rule)
+//   3. Session memory compression
+//
+// Per-generation (every GENERATION_SIZE sessions):
+//   4. Tournament selection (bottom rules demoted)
+//   5. Crossover (combine high-fitness rules)
+//   6. Mutation (create rule variants)
+//   7. Immigration (revive dormant rules)
+//   8. Promote candidates to active
+//   9. Reflection (every 2 generations)
+//   10. Write active rules to CLAUDE.md
 
 const fs = require('fs');
 const path = require('path');
@@ -21,37 +22,10 @@ const DATA_DIR = path.join(__dirname, 'data');
 const PENDING_PATH = path.join(DATA_DIR, 'pending.json');
 const PROCESS_LOG = path.join(DATA_DIR, 'process.log');
 const NARRATIVE_LOG = path.join(DATA_DIR, 'narrative.jsonl');
-const SESSION_COUNTER = path.join(DATA_DIR, 'session_counter.json');
 
 function log(msg) {
   const line = `[${new Date().toISOString()}] ${msg}\n`;
   try { fs.appendFileSync(PROCESS_LOG, line, 'utf8'); } catch {}
-}
-
-function getSessionCount(project) {
-  try {
-    const data = JSON.parse(fs.readFileSync(SESSION_COUNTER, 'utf8'));
-    return data[project] || 0;
-  } catch { return 0; }
-}
-
-function incrementSessionCount(project) {
-  let data = {};
-  try { data = JSON.parse(fs.readFileSync(SESSION_COUNTER, 'utf8')); } catch {}
-  data[project] = (data[project] || 0) + 1;
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(SESSION_COUNTER, JSON.stringify(data, null, 2), 'utf8');
-  return data[project];
-}
-
-function readRecentChangelog(maxEntries) {
-  try {
-    const lines = fs.readFileSync(path.join(DATA_DIR, 'changelog.jsonl'), 'utf8')
-      .trim().split('\n').filter(Boolean);
-    return lines.slice(-(maxEntries || 10)).map(l => {
-      try { return JSON.parse(l); } catch { return null; }
-    }).filter(Boolean);
-  } catch { return []; }
 }
 
 function readRecentNarratives(maxEntries) {
@@ -64,491 +38,289 @@ function readRecentNarratives(maxEntries) {
 }
 
 async function main() {
-  // Accept pending file path as CLI argument (supports concurrent sessions)
   const pendingFile = process.argv[2] || PENDING_PATH;
   log('processRules started (pending: ' + path.basename(pendingFile) + ')');
 
-  // Read pending data
   let pending;
   try {
     pending = JSON.parse(fs.readFileSync(pendingFile, 'utf8'));
   } catch (err) {
-    log('No pending data or parse error: ' + (err.message || err));
+    log('No pending data: ' + (err.message || err));
     return;
   }
 
   if (!pending || !pending.project) {
-    log('Invalid pending data, skipping');
+    log('Invalid pending data');
     return;
   }
 
-  const { project, newMemories, observations, sessionBehavior, recentSessions, existingActiveRules, handWrittenContent } = pending;
-  log(`Project: ${project}, memories: ${(newMemories || []).length}, observations: ${(observations || []).length}, existing rules: ${(existingActiveRules || []).length}`);
+  const { project, newMemories, observations, sessionBehavior, recentSessions, handWrittenContent } = pending;
+  log(`Project: ${project}, memories: ${(newMemories || []).length}, observations: ${(observations || []).length}`);
 
   const ruleEngine = require('./ruleEngine');
   const claudeMdWriter = require('./claudeMdWriter');
   const llmBrain = require('./llmBrain');
 
-  const sessionNum = incrementSessionCount(project);
-  log(`Session #${sessionNum} for this project`);
-
-  // =====================================================================
-  // STEP 1: Strategy Selection
-  // =====================================================================
-  let strategy = 'reinforce'; // default
-  try {
-    const stratResult = llmBrain.selectStrategy(
-      sessionBehavior, newMemories, recentSessions, existingActiveRules
-    );
-    if (stratResult && stratResult.strategy) {
-      strategy = stratResult.strategy;
-      log(`Strategy: ${strategy} — ${stratResult.reason || ''}`);
-    }
-  } catch (stratErr) {
-    log(`Strategy selection failed, defaulting to reinforce: ${stratErr.message || stratErr}`);
-  }
-
-  const newRuleIds = new Set();
   let rulesAdded = 0;
-  let behaviorRulesAdded = 0;
   let conflictsFound = 0;
-  const correctionTexts = [];
+
+  const stats = ruleEngine.getPopulationStats(project);
+  log(`Population: gen=${stats.generation} active=${stats.active} candidate=${stats.candidate} dormant=${stats.dormant} dead=${stats.dead}`);
 
   // =====================================================================
-  // STEP 2: Correction-based rule creation (all strategies except 'explore')
+  // STEP 1: Birth new rules from corrections (as CANDIDATES, not active)
   // =====================================================================
-  if (strategy !== 'explore') {
-    for (const mem of (newMemories || [])) {
-      try {
-        log(`Extracting rule from: ${mem.name}`);
-        const extracted = llmBrain.extractRule(mem);
+  for (const mem of (newMemories || [])) {
+    try {
+      const extracted = llmBrain.extractRule(mem);
+      if (!extracted || !extracted.rule) continue;
 
-        if (!extracted || !extracted.rule) {
-          log(`  Extraction failed for: ${mem.name}. Got: ${JSON.stringify(extracted)}`);
-          continue;
-        }
+      const ruleContent = extracted.rule;
+      const keywords = extracted.keywords || [];
+      log(`  Extracted: "${ruleContent.slice(0, 80)}"`);
 
-        const ruleContent = extracted.rule;
-        const keywords = extracted.keywords || [];
-        correctionTexts.push(ruleContent + ' ' + (mem.content || ''));
-        log(`  Extracted: "${ruleContent.slice(0, 80)}"`);
-
-        // Conflict check
-        log(`  Checking conflict...`);
-        const conflictCheck = llmBrain.checkConflict(ruleContent, handWrittenContent || '');
-
-        if (!conflictCheck) {
-          log(`  Conflict check failed, skipping`);
-          continue;
-        }
-
-        log(`  Decision: ${conflictCheck.decision} — ${conflictCheck.reason || ''}`);
-
-        if (conflictCheck.decision === 'duplicate') {
-          log(`  Skipped (duplicate)`);
-          ruleEngine.logChange({
-            action: 'skip_duplicate', project,
-            content: ruleContent.slice(0, 300), reason: conflictCheck.reason,
-          });
-          continue;
-        }
-
-        if (conflictCheck.decision === 'conflict') {
-          ruleEngine.addConflict(project, ruleContent, conflictCheck.conflicts_with || '', 1.0);
-          conflictsFound++;
-          log(`  Saved as conflict`);
-          continue;
-        }
-
-        // Check duplicate against existing auto-learned rules
-        if (ruleEngine.isDuplicate(project, keywords)) {
-          log(`  Skipped (duplicate of auto-learned)`);
-          continue;
-        }
-
-        const rule = ruleEngine.addRule(project, ruleContent, 'correction', keywords);
-        newRuleIds.add(rule.id);
-        rulesAdded++;
-        log(`  Added rule: ${rule.id}`);
-      } catch (memErr) {
-        log(`  Error processing "${mem.name}": ${memErr.message || memErr}`);
+      // Conflict check against hand-written rules
+      const conflictCheck = llmBrain.checkConflict(ruleContent, handWrittenContent || '');
+      if (conflictCheck && conflictCheck.decision === 'duplicate') {
+        log(`  Skip (duplicate): ${conflictCheck.reason || ''}`);
+        continue;
       }
+      if (conflictCheck && conflictCheck.decision === 'conflict') {
+        ruleEngine.addConflict(project, ruleContent, conflictCheck.conflicts_with || '', 1.0);
+        conflictsFound++;
+        log(`  Conflict saved`);
+        continue;
+      }
+
+      if (ruleEngine.isDuplicate(project, keywords)) {
+        log(`  Skip (dup in population)`);
+        continue;
+      }
+
+      // Born as CANDIDATE — must earn its way to active via tournament
+      // Exception: if population has < 3 active rules, go directly to active (bootstrap)
+      const activeCount = ruleEngine.getActiveRules(project).length;
+      const initialStatus = activeCount < 3 ? 'active' : 'candidate';
+      ruleEngine.addRule(project, ruleContent, 'correction', keywords, initialStatus);
+      rulesAdded++;
+      log(`  Born as ${initialStatus}: "${ruleContent.slice(0, 60)}"`);
+    } catch (err) {
+      log(`  Error: ${err.message || err}`);
     }
-  } else {
-    log('Strategy=explore: skipping rule creation, observing only');
   }
 
   // =====================================================================
-  // STEP 3: Fitness evaluation
+  // STEP 2: Birth rules from observation analysis (as CANDIDATES)
   // =====================================================================
-  const currentRules = ruleEngine.getActiveRules(project).filter(r => !newRuleIds.has(r.id));
-
-  if (currentRules.length > 0 && correctionTexts.length > 0) {
-    log(`Evaluating fitness: ${currentRules.length} rules vs ${correctionTexts.length} corrections`);
+  if (observations && observations.length >= 3) {
     try {
-      const matchResult = llmBrain.matchCorrections(correctionTexts, currentRules);
-      if (matchResult && Array.isArray(matchResult.matches)) {
-        const data = ruleEngine.loadRules();
-        const matchedIds = new Set();
+      log(`Analyzing ${observations.length} observations...`);
+      const activeRules = ruleEngine.getActiveRules(project);
+      const obsResult = llmBrain.analyzeObservations(observations, activeRules, handWrittenContent);
 
-        for (const match of matchResult.matches) {
-          const rule = data.rules.find(r => r.id === match.rule_id);
-          if (!rule || rule.status !== 'active') continue;
-          matchedIds.add(rule.id);
-
-          if (match.confidence === 'high' || match.confidence === 'medium') {
-            const penalty = match.confidence === 'high' ? -2 : -1;
-            rule.fitness += penalty;
-            rule.last_evaluated = new Date().toISOString().slice(0, 10);
-            rule.sessions_evaluated += 1;
-            log(`  ${rule.id}: fitness ${penalty} (${match.confidence}) → ${rule.fitness}`);
-          } else {
-            rule.fitness += 1;
-            rule.last_evaluated = new Date().toISOString().slice(0, 10);
-            rule.sessions_evaluated += 1;
-          }
+      if (obsResult) {
+        for (const pattern of (obsResult.patterns || [])) {
+          if (!pattern.rule || pattern.confidence === 'low') continue;
+          const kw = pattern.keywords || [];
+          if (ruleEngine.isDuplicate(project, kw)) continue;
+          ruleEngine.addRule(project, pattern.rule, 'observation', kw, 'candidate');
+          rulesAdded++;
+          log(`  Observation candidate: "${pattern.rule.slice(0, 60)}"`);
         }
-
-        // Unmentioned rules get +1
-        for (const rule of data.rules) {
-          if (rule.project === project && rule.status === 'active'
-              && !newRuleIds.has(rule.id) && !matchedIds.has(rule.id)) {
-            rule.fitness += 1;
-            rule.last_evaluated = new Date().toISOString().slice(0, 10);
-            rule.sessions_evaluated += 1;
-          }
+        for (const ap of (obsResult.anti_patterns || [])) {
+          if (!ap.rule || ap.confidence === 'low') continue;
+          const kw = ap.keywords || [];
+          if (ruleEngine.isDuplicate(project, kw)) continue;
+          ruleEngine.addRule(project, ap.rule, 'anti_pattern', kw, 'candidate');
+          rulesAdded++;
+          log(`  Anti-pattern candidate: "${ap.rule.slice(0, 60)}"`);
         }
-        ruleEngine.saveRules(data);
       }
-    } catch (fitErr) {
-      log(`Fitness error: ${fitErr.message || fitErr}`);
+    } catch (err) {
+      log(`Observation analysis error: ${err.message || err}`);
+    }
+  }
+
+  // =====================================================================
+  // STEP 3: Relevance-aware fitness scoring
+  // =====================================================================
+  const activeRules = ruleEngine.getActiveRules(project);
+  if (activeRules.length > 0) {
+    try {
+      log(`Evaluating relevance for ${activeRules.length} active rules...`);
+      const relevanceResult = llmBrain.evaluateRelevance(activeRules, observations, newMemories);
+
+      if (relevanceResult && Array.isArray(relevanceResult.evaluations)) {
+        const changes = ruleEngine.scoreFitness(project, relevanceResult.evaluations);
+        const relevant = changes.filter(c => c.reason !== 'not_relevant');
+        const notRelevant = changes.filter(c => c.reason === 'not_relevant');
+        log(`  Fitness: ${relevant.length} relevant (${changes.filter(c => c.delta > 0).length} followed, ${changes.filter(c => c.delta < 0).length} failed), ${notRelevant.length} not relevant`);
+      }
+    } catch (err) {
+      log(`Relevance evaluation error: ${err.message || err}`);
+      // Fallback: old-style +1 for all
       ruleEngine.evaluateFitness(project, [], new Set());
     }
-  } else if (currentRules.length > 0) {
-    log('No corrections, all rules get +1');
-    ruleEngine.evaluateFitness(project, [], new Set());
   }
 
   // =====================================================================
-  // STEP 4a: Observation-based pattern analysis (from full tool call records)
+  // STEP 4: Check if generation is complete
   // =====================================================================
-  let observationAnalysis = null;
-  let hasUsablePatterns = false;
-  if (strategy !== 'explore' && (observations || []).length >= 3) {
-    log(`Analyzing ${observations.length} observations for patterns...`);
-    try {
-      const currentActive = ruleEngine.getActiveRules(project);
-      observationAnalysis = llmBrain.analyzeObservations(observations, currentActive, handWrittenContent || '');
+  const isNewGeneration = ruleEngine.tickSession(project);
 
-      // Check if analysis returned usable results (not just { raw: "..." } from JSON fail)
-      hasUsablePatterns = observationAnalysis
-        && (Array.isArray(observationAnalysis.patterns) || Array.isArray(observationAnalysis.anti_patterns));
+  if (isNewGeneration) {
+    const gen = ruleEngine.advanceGeneration(project);
+    log(`\n=== GENERATION ${gen} ===`);
 
-      if (hasUsablePatterns) {
-        // Collect all candidate rules (patterns + anti-patterns) for batch conflict check
-        const candidates = [];
-        for (const pattern of (observationAnalysis.patterns || [])) {
-          if (!pattern.rule || pattern.confidence === 'low') continue;
-          const keywords = pattern.keywords || [];
-          if (ruleEngine.isDuplicate(project, keywords)) {
-            log(`  Obs pattern skip (dup): "${pattern.rule.slice(0, 60)}"`);
-            continue;
-          }
-          candidates.push({ rule: pattern.rule, keywords, source: 'observation', confidence: pattern.confidence });
-        }
-        for (const ap of (observationAnalysis.anti_patterns || [])) {
-          if (!ap.rule || ap.confidence === 'low') continue;
-          const keywords = ap.keywords || [];
-          if (ruleEngine.isDuplicate(project, keywords)) {
-            log(`  Anti-pattern skip (dup): "${ap.rule.slice(0, 60)}"`);
-            continue;
-          }
-          candidates.push({ rule: ap.rule, keywords, source: 'anti_pattern', confidence: ap.confidence });
-        }
+    // ----- Tournament selection -----
+    log('Running tournament selection...');
+    const { promoted, demoted } = ruleEngine.tournamentSelection(project);
+    log(`  Demoted: ${demoted.length}, Promoted: ${promoted.length}`);
 
-        // Batch conflict check (1 LLM call instead of N)
-        if (candidates.length > 0) {
-          const batchResult = llmBrain.checkConflictBatch(
-            candidates.map(c => c.rule),
-            handWrittenContent || ''
-          );
-          const results = (batchResult && batchResult.results) || [];
-
-          for (let i = 0; i < candidates.length; i++) {
-            const cand = candidates[i];
-            const check = results.find(r => r.index === i) || { decision: 'new' };
-
-            if (check.decision === 'duplicate') {
-              log(`  ${cand.source} skip (dup of handwritten): "${cand.rule.slice(0, 60)}"`);
-              continue;
+    // ----- Crossover -----
+    const postTournamentActive = ruleEngine.getActiveRules(project);
+    if (postTournamentActive.length >= 2) {
+      log('Running crossover...');
+      // Pick two highest-confidence parents
+      const sorted = postTournamentActive.sort((a, b) => ruleEngine.confidence(b) - ruleEngine.confidence(a));
+      for (let i = 0; i < ruleEngine.CROSSOVER_COUNT && i < Math.floor(sorted.length / 2); i++) {
+        try {
+          const parentA = sorted[i * 2];
+          const parentB = sorted[i * 2 + 1];
+          const result = llmBrain.crossover(parentA, parentB);
+          if (result && result.offspring && result.offspring.length > 5) {
+            if (!ruleEngine.isDuplicate(project, result.keywords || [])) {
+              ruleEngine.addRule(project, result.offspring, 'crossover', result.keywords, 'candidate');
+              log(`  Offspring: "${result.offspring.slice(0, 60)}" (from ${parentA.id.slice(0,8)} x ${parentB.id.slice(0,8)})`);
             }
-            if (check.decision === 'conflict') {
-              ruleEngine.addConflict(project, cand.rule, check.conflicts_with || '', 1.0);
-              conflictsFound++;
-              log(`  ${cand.source} conflict: "${cand.rule.slice(0, 60)}"`);
-              continue;
-            }
-
-            const rule = ruleEngine.addRule(project, cand.rule, cand.source, cand.keywords);
-            log(`  ${cand.source} rule: ${rule.id} (${cand.confidence}) "${cand.rule.slice(0, 60)}"`);
-            behaviorRulesAdded++;
           }
+        } catch (err) {
+          log(`  Crossover error: ${err.message || err}`);
         }
       }
-    } catch (obsErr) {
-      log(`Observation analysis error: ${obsErr.message || obsErr}`);
     }
-  }
 
-  // =====================================================================
-  // STEP 4b: Behavior pattern analysis — legacy (from aggregated stats)
-  // Only runs if observation analysis didn't already cover it
-  // =====================================================================
-  if (!hasUsablePatterns && (strategy === 'reinforce' || strategy === 'repair') && sessionBehavior && sessionBehavior.toolCalls >= 5) {
-    log(`Analyzing behavior (legacy): ${sessionBehavior.toolCalls} calls, phases=[${(sessionBehavior.workflowPhases || []).join(',')}]`);
-    try {
-      const currentActive = ruleEngine.getActiveRules(project);
-      const patternResult = llmBrain.analyzeSessionPatterns(sessionBehavior, recentSessions, currentActive);
-
-      if (patternResult && Array.isArray(patternResult.patterns)) {
-        for (const pattern of patternResult.patterns) {
-          if (!pattern.rule || pattern.confidence === 'low') continue;
-
-          const keywords = pattern.keywords || [];
-          if (ruleEngine.isDuplicate(project, keywords)) {
-            log(`  Pattern skip (dup): "${pattern.rule.slice(0, 60)}"`);
-            continue;
+    // ----- Mutation -----
+    log('Running mutation...');
+    const toMutate = postTournamentActive.filter(() => Math.random() < ruleEngine.MUTATION_RATE);
+    for (const rule of toMutate) {
+      try {
+        const result = llmBrain.mutate(rule);
+        if (result && result.mutant && result.mutant.length > 5) {
+          if (!ruleEngine.isDuplicate(project, result.keywords || [])) {
+            ruleEngine.addRule(project, result.mutant, 'mutation', result.keywords, 'candidate');
+            log(`  Mutant (${result.mutation_type || '?'}): "${result.mutant.slice(0, 60)}"`);
           }
-
-          const conflict = ruleEngine.detectConflict(pattern.rule, handWrittenContent || '');
-          if (conflict.hasConflict) {
-            ruleEngine.addConflict(project, pattern.rule, conflict.conflictsWith, conflict.similarity);
-            conflictsFound++;
-            continue;
-          }
-
-          const rule = ruleEngine.addRule(project, pattern.rule, 'behavior', keywords);
-          log(`  Behavior rule: ${rule.id} (${pattern.confidence}) "${pattern.rule.slice(0, 60)}"`);
-          behaviorRulesAdded++;
         }
+      } catch (err) {
+        log(`  Mutation error: ${err.message || err}`);
       }
-    } catch (patErr) {
-      log(`Behavior analysis error: ${patErr.message || patErr}`);
     }
-  }
 
-  // =====================================================================
-  // STEP 5: Pruning
-  // =====================================================================
-  const pruned = ruleEngine.pruneRules(project);
-  if (pruned.length > 0) log(`Pruned ${pruned.length} rules`);
+    // ----- Immigration -----
+    log('Running immigration...');
+    const revived = ruleEngine.immigration(project);
+    if (revived.length > 0) log(`  Revived ${revived.length} from dormant`);
 
-  // =====================================================================
-  // STEP 6: Distillation (distill strategy or 8+ active rules)
-  // =====================================================================
-  const preDistillActive = ruleEngine.getActiveRules(project);
-  if (strategy === 'distill' || preDistillActive.length >= 8) {
-    log(`Distilling ${preDistillActive.length} rules (strategy=${strategy})`);
-    try {
-      const distillResult = llmBrain.tryDistill(preDistillActive);
-      if (distillResult && distillResult.should_distill && Array.isArray(distillResult.groups)) {
-        const data = ruleEngine.loadRules();
-        for (const group of distillResult.groups) {
-          if (!group.source_ids || group.source_ids.length < 2 || !group.merged_rule) continue;
-
-          for (const srcId of group.source_ids) {
-            const src = data.rules.find(r => r.id === srcId);
-            if (src) src.status = 'distilled';
-          }
-
-          const maxFitness = Math.max(...group.source_ids.map(id => {
-            const r = data.rules.find(x => x.id === id);
-            return r ? r.fitness : 0;
-          }));
-
-          data.rules.push({
-            id: ruleEngine.generateId(), project,
-            type: 'rule', content: group.merged_rule, source: 'distillation',
-            keywords: group.merged_keywords || [],
-            fitness: maxFitness,
-            created: new Date().toISOString().slice(0, 10),
-            last_evaluated: new Date().toISOString().slice(0, 10),
-            sessions_evaluated: 0, status: 'active',
-            distilled_from: group.source_ids,
-          });
-
-          log(`  Distilled ${group.source_ids.length} → "${group.merged_rule.slice(0, 80)}"`);
-          ruleEngine.logChange({
-            action: 'distill_rules', project,
-            distilled_from: group.source_ids, content: group.merged_rule.slice(0, 300),
-          });
-        }
-        ruleEngine.saveRules(data);
-      }
-    } catch (distErr) {
-      log(`Distillation error: ${distErr.message || distErr}`);
-    }
-  }
-
-  // =====================================================================
-  // STEP 7: Reflection (every 5 sessions)
-  // =====================================================================
-  if (sessionNum % 5 === 0) {
-    log(`Reflection triggered (session #${sessionNum})`);
-    try {
-      const allActive = ruleEngine.getActiveRules(project);
-      if (allActive.length > 0) {
-        const narratives = readRecentNarratives(5);
-        const changelog = readRecentChangelog(10);
-        const reflectResult = llmBrain.reflectOnRules(allActive, narratives, changelog);
+    // ----- Reflection (every 2 generations) -----
+    const popData = ruleEngine.loadPopulation();
+    if (popData.generation % 2 === 0) {
+      log('Running reflection...');
+      try {
+        const allActive = ruleEngine.getActiveRules(project);
+        const narratives = readRecentNarratives(5).map(n => n.narrative || '');
+        const reflectResult = llmBrain.reflectOnRules(allActive, narratives, []);
 
         if (reflectResult && Array.isArray(reflectResult.insights)) {
-          const data = ruleEngine.loadRules();
+          const data = ruleEngine.loadPopulation();
           for (const insight of reflectResult.insights) {
-            log(`  Reflection [${insight.action}] ${insight.rule_ids.join(',')} — ${insight.reason}`);
+            log(`  Reflection [${insight.action}] ${(insight.rule_ids || []).join(',')} — ${insight.reason || ''}`);
 
             if (insight.action === 'remove') {
-              for (const id of insight.rule_ids) {
-                const r = data.rules.find(x => x.id === id && x.status === 'active');
-                if (r) {
-                  r.status = 'reflected_out';
-                  ruleEngine.logChange({
-                    action: 'reflection_remove', rule_id: id, project,
-                    reason: insight.reason, content: r.content.slice(0, 200),
-                  });
+              for (const id of (insight.rule_ids || [])) {
+                const r = data.population.find(x => x.id === id);
+                if (r && r.status === 'active') {
+                  r.status = 'dormant'; // Reflection demotes, doesn't kill
+                  ruleEngine.logChange({ action: 'reflection_demote', rule_id: id, project, reason: insight.reason });
                 }
               }
             }
-
             if (insight.action === 'revise' && insight.revised_content) {
-              for (const id of insight.rule_ids) {
-                const r = data.rules.find(x => x.id === id && x.status === 'active');
+              for (const id of (insight.rule_ids || [])) {
+                const r = data.population.find(x => x.id === id);
                 if (r) {
-                  const oldContent = r.content;
-                  r.content = insight.revised_content;
-                  r.keywords = ruleEngine.extractKeywords(insight.revised_content);
                   ruleEngine.logChange({
                     action: 'reflection_revise', rule_id: id, project,
-                    reason: insight.reason,
-                    old_content: oldContent.slice(0, 200),
-                    new_content: insight.revised_content.slice(0, 200),
+                    old: r.content.slice(0, 200), new: insight.revised_content.slice(0, 200),
                   });
+                  r.content = insight.revised_content;
+                  r.keywords = ruleEngine.extractKeywords(insight.revised_content);
                 }
               }
             }
-
-            if (insight.action === 'merge' && insight.rule_ids.length >= 2 && insight.revised_content) {
-              for (const id of insight.rule_ids) {
-                const r = data.rules.find(x => x.id === id && x.status === 'active');
-                if (r) r.status = 'reflected_merged';
-              }
-              const maxFit = Math.max(...insight.rule_ids.map(id => {
-                const r = data.rules.find(x => x.id === id);
-                return r ? r.fitness : 0;
-              }));
-              data.rules.push({
-                id: ruleEngine.generateId(), project,
-                type: 'rule', content: insight.revised_content, source: 'reflection',
-                keywords: ruleEngine.extractKeywords(insight.revised_content),
-                fitness: maxFit,
-                created: new Date().toISOString().slice(0, 10),
-                last_evaluated: new Date().toISOString().slice(0, 10),
-                sessions_evaluated: 0, status: 'active',
-                merged_from: insight.rule_ids,
-              });
-              ruleEngine.logChange({
-                action: 'reflection_merge', project,
-                merged_from: insight.rule_ids, content: insight.revised_content.slice(0, 200),
-              });
-            }
           }
-          ruleEngine.saveRules(data);
+          ruleEngine.savePopulation(data);
         }
+      } catch (err) {
+        log(`Reflection error: ${err.message || err}`);
       }
-    } catch (refErr) {
-      log(`Reflection error: ${refErr.message || refErr}`);
     }
+
+    // Log generation summary
+    const genStats = ruleEngine.getPopulationStats(project);
+    log(`Generation ${gen} complete: active=${genStats.active} candidate=${genStats.candidate} dormant=${genStats.dormant} dead=${genStats.dead} avg_confidence=${genStats.avg_confidence}`);
   }
 
   // =====================================================================
-  // STEP 8: Compress observations → session memory .md
-  // (replaces old narrateSession — compressSession generates both summary and narrative)
+  // STEP 5: Session memory compression
   // =====================================================================
   let sessionId = null;
-  if ((observations || []).length >= 3) {
-    log('Compressing session to memory...');
-    try {
-      const sessionMemory = require('./sessionMemory');
-      sessionId = sessionMemory.generateSessionId();
+  try {
+    const sessionMemory = require('./sessionMemory');
+    sessionId = sessionMemory.generateSessionId();
 
-      // Collect rule changes for context
-      const rulesChanged = [];
-      if (rulesAdded > 0) rulesChanged.push({ action: 'added', content: `${rulesAdded} correction rules` });
-      if (behaviorRulesAdded > 0) rulesChanged.push({ action: 'added', content: `${behaviorRulesAdded} observation rules` });
-      if (pruned.length > 0) rulesChanged.push({ action: 'pruned', content: `${pruned.length} rules` });
-
-      const compressed = llmBrain.compressSession(observations, newMemories, rulesChanged);
-      const projectName = path.basename(project);
-
-      if (compressed && compressed.summary) {
-        // Write narrative to narrative.jsonl (backward compat with reflection step)
-        try {
-          const narrativeEntry = {
-            timestamp: new Date().toISOString(),
-            project,
-            strategy,
-            narrative: compressed.index_line || compressed.summary.split('\n')[0] || '',
-          };
-          fs.appendFileSync(NARRATIVE_LOG, JSON.stringify(narrativeEntry) + '\n', 'utf8');
-        } catch {}
-
-        // Write session .md (Tier 2 + Tier 3)
-        const sessionPath = sessionMemory.writeSession(sessionId, compressed, observations, {
-          project: projectName,
-          toolCalls: (observations || []).length,
-          strategy,
-          rulesAdded: rulesAdded + behaviorRulesAdded,
-          rulesPruned: pruned.length,
-        });
-        log(`  Session memory: ${sessionPath}`);
-
-        // Append to index.md (Tier 1)
-        const indexLine = compressed.index_line || `${(observations || []).length} tool calls, ${strategy} strategy`;
-        sessionMemory.appendIndex(sessionId, indexLine, (observations || []).length, projectName);
-        log(`  Index updated: ${indexLine}`);
-      } else {
-        log('  Compression returned empty summary, skipping memory write');
-      }
-    } catch (memErr) {
-      log(`Session memory error: ${memErr.message || memErr}`);
+    const compressResult = llmBrain.compressSession(observations, newMemories, []);
+    if (compressResult && compressResult.summary) {
+      const popStats = ruleEngine.getPopulationStats(project);
+      sessionMemory.writeSession(sessionId, compressResult, observations || [], {
+        project, toolCalls: (observations || []).length,
+        strategy: isNewGeneration ? 'generation' : 'session',
+        rulesAdded, rulesPruned: 0,
+      });
+      sessionMemory.appendIndex(
+        sessionId,
+        compressResult.index_line || compressResult.summary.split('\n')[0].slice(0, 100),
+        (observations || []).length,
+        path.basename(project)
+      );
+      log(`Session memory: ${sessionId}`);
     }
+  } catch (err) {
+    log(`Session memory error: ${err.message || err}`);
   }
 
   // =====================================================================
-  // STEP 9: Write CLAUDE.md + summary
+  // STEP 6: Write active rules to CLAUDE.md
   // =====================================================================
   const finalActive = ruleEngine.getActiveRules(project);
   const writtenPath = claudeMdWriter.writeRulesToClaudeMd(project, finalActive);
-  log(`Wrote ${finalActive.length} rules to ${writtenPath || 'none'}`);
+  log(`Wrote ${finalActive.length} active rules to ${writtenPath || 'CLAUDE.md'}`);
 
+  // Summary
+  const finalStats = ruleEngine.getPopulationStats(project);
   ruleEngine.logChange({
-    action: 'session_end_summary', project, strategy,
-    session_number: sessionNum,
-    memories_found: (newMemories || []).length,
-    observations_count: (observations || []).length,
-    rules_added: rulesAdded,
-    behavior_rules_added: behaviorRulesAdded,
-    conflicts_found: conflictsFound,
-    rules_pruned: pruned.length,
-    active_rules: finalActive.length,
-    claude_md_updated: !!writtenPath,
-    session_memory_id: sessionId,
+    action: 'session_complete', project,
+    generation: finalStats.generation,
+    is_new_generation: isNewGeneration,
+    rules_born: rulesAdded,
+    conflicts: conflictsFound,
+    population: finalStats,
   });
 
-  // Remove pending file (session-specific or default)
+  // Remove pending file
   try { fs.unlinkSync(pendingFile); } catch {}
 
-  log(`Done [${strategy}]: +${rulesAdded} corrections, +${behaviorRulesAdded} behavior(obs), ${conflictsFound} conflicts, ${pruned.length} pruned, ${finalActive.length} active, memory=${sessionId || 'none'}`);
+  log(`Done: gen=${finalStats.generation} born=${rulesAdded} active=${finalStats.active} candidate=${finalStats.candidate} dormant=${finalStats.dormant} ${isNewGeneration ? '(GENERATION CYCLE RAN)' : ''}`);
 }
 
 main().catch(err => {

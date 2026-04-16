@@ -583,6 +583,139 @@ Reply JSON only:
   return askClaudeWithRetry(prompt, 35000, 'smart');
 }
 
+// ===================== GA Operators =====================
+
+/**
+ * Evaluate relevance of each active rule to a session.
+ * For each rule, determines: relevant? followed? corrected?
+ * This is the core fitness signal — only relevant rules get scored.
+ *
+ * @param {Array} activeRules - Current active rules
+ * @param {Array} observations - Session observation timeline
+ * @param {Array} corrections - New correction memories from this session
+ * @returns {{ evaluations: [{ rule_id, relevant, followed, corrected }] }}
+ */
+function evaluateRelevance(activeRules, observations, corrections) {
+  if (!activeRules || activeRules.length === 0) return { evaluations: [] };
+
+  const rulesDesc = activeRules.map(r =>
+    `[${r.id}] ${r.content.slice(0, 150)}`
+  ).join('\n');
+
+  const timeline = (observations || []).slice(-20).map(obs => {
+    const input = (obs.input || '').slice(0, 200);
+    return `${obs.tool}: ${input}`;
+  }).join('\n');
+
+  const corrDesc = (corrections || []).map(c =>
+    `- ${c.name || ''}: ${(c.description || c.content || '').slice(0, 100)}`
+  ).join('\n') || '(none)';
+
+  const prompt = `GA fitness evaluator. For each rule, determine if it was RELEVANT to this session, and if so, whether the user's behavior FOLLOWED it.
+
+RULES:
+${rulesDesc}
+
+SESSION BEHAVIOR (tool calls):
+${timeline || '(empty session)'}
+
+USER CORRECTIONS THIS SESSION:
+${corrDesc}
+
+For each rule:
+- "relevant": was the rule's topic active in this session? (e.g., a rule about "Read before Edit" is relevant if Edit was used)
+- "followed": did the user's behavior match the rule? (e.g., did they actually Read before Edit?)
+- "corrected": did any correction explicitly address the same topic as this rule?
+
+Reply JSON only:
+{"evaluations": [{"rule_id": "<id>", "relevant": true/false, "followed": true/false, "corrected": false}]}`;
+
+  return askClaudeWithRetry(prompt, 25000, 'fast');
+}
+
+/**
+ * Crossover: combine two high-fitness rules into a new offspring rule.
+ * The LLM synthesizes the best parts of both parents.
+ *
+ * @param {object} parentA - First parent rule
+ * @param {object} parentB - Second parent rule
+ * @returns {{ offspring: string, keywords: string[] } | null}
+ */
+function crossover(parentA, parentB) {
+  const prompt = `GA crossover operator. Combine two successful rules into ONE new rule that captures the essence of both.
+
+PARENT A (fitness=${parentA.fitness}): ${parentA.content}
+PARENT B (fitness=${parentB.fitness}): ${parentB.content}
+
+Create ONE offspring rule that:
+- Combines the key insights from both parents
+- Is more specific or more complete than either parent alone
+- Is a single actionable instruction
+
+Reply JSON only:
+{"offspring": "<the new combined rule>", "keywords": ["<key terms>"]}
+
+If the parents are too different to meaningfully combine, reply: {"offspring": "", "keywords": []}`;
+
+  return askClaudeWithRetry(prompt, 20000, 'smart');
+}
+
+/**
+ * Mutation: create a variant of an existing rule.
+ * The LLM rewrites it slightly differently — maybe more specific, broader, or rephrased.
+ *
+ * @param {object} rule - The rule to mutate
+ * @returns {{ mutant: string, keywords: string[], mutation_type: string } | null}
+ */
+function mutate(rule) {
+  const prompt = `GA mutation operator. Create a VARIANT of this rule. Change it in ONE of these ways:
+- Specialize: make it more specific (add a condition or context)
+- Generalize: make it broader (remove unnecessary constraints)
+- Rephrase: say the same thing differently (might be clearer)
+- Strengthen: add consequences or emphasis
+
+ORIGINAL RULE (fitness=${rule.fitness}): ${rule.content}
+
+Reply JSON only:
+{"mutant": "<the modified rule>", "keywords": ["<key terms>"], "mutation_type": "specialize|generalize|rephrase|strengthen"}`;
+
+  return askClaudeWithRetry(prompt, 20000, 'fast');
+}
+
+/**
+ * Batch evaluation: determine relevance + compliance for all active rules in one call.
+ * More efficient than calling evaluateRelevance per-rule.
+ */
+function evaluateGeneration(activeRules, recentSessionSummaries) {
+  if (!activeRules || activeRules.length === 0) return { rankings: [] };
+
+  const rulesDesc = activeRules.map(r =>
+    `[${r.id}] fitness=${r.fitness} relevance=${r.relevance_count || 0} conf=${(r.fitness / Math.sqrt(Math.max(r.relevance_count || 1, 1))).toFixed(1)} | ${r.content.slice(0, 120)}`
+  ).join('\n');
+
+  const sessionsDesc = (recentSessionSummaries || []).slice(-5).map(s =>
+    `- ${s}`
+  ).join('\n') || '(no session data)';
+
+  const prompt = `GA generation evaluator. Rank these rules by how useful they've been across recent sessions.
+
+ACTIVE RULES:
+${rulesDesc}
+
+RECENT SESSION SUMMARIES:
+${sessionsDesc}
+
+For each rule, assign a rank from 1 (best) to N (worst) based on:
+- Is it relevant to the user's actual work?
+- Does it address a real, recurring need?
+- Is its fitness justified by real evidence, or just untested?
+
+Reply JSON only:
+{"rankings": [{"rule_id": "<id>", "rank": N, "verdict": "strong|adequate|weak|untested"}]}`;
+
+  return askClaudeWithRetry(prompt, 25000, 'smart');
+}
+
 module.exports = {
   askClaude,
   extractRule,
@@ -596,4 +729,9 @@ module.exports = {
   analyzeObservations,
   compressSession,
   checkConflictBatch,
+  // GA operators
+  evaluateRelevance,
+  crossover,
+  mutate,
+  evaluateGeneration,
 };
