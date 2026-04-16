@@ -1,18 +1,50 @@
 # claude-evolve
 
-A self-evolving learning system for [Claude Code](https://claude.com/claude-code). It observes how you work, learns from your corrections and behavior patterns, and automatically writes rules to your project's `CLAUDE.md` — making Claude Code better at helping you over time.
+Claude Code watches what you do. This watches what Claude Code does, and makes it better at working with you.
+
+Most "memory" tools for AI assistants just store and retrieve. claude-evolve **evolves** — it spots your mistakes before you correct them, learns patterns you never explicitly teach, prunes rules that stop helping, and gets sharper every session.
+
+## The thing that matters most: anti-pattern detection
+
+Other tools wait for you to say "don't do that." claude-evolve watches the full session timeline — every Read, Edit, Bash, every MCP call — and spots suboptimal behaviors on its own.
+
+Edit without Read first? It notices. Query without dry-run? It notices. Same file opened 4 times because grep wasn't used? It notices.
+
+These become corrective rules automatically. You don't have to say anything.
+
+```markdown
+<!-- evolver:rule id=r_ghi fitness=3 created=2026-04-16 source=anti_pattern -->
+- Always Read a file before Edit — blind edits cause errors
+<!-- /evolver:rule -->
+```
+
+This is the difference between a memory system and a learning system.
+
+## When this helps / When it doesn't
+
+**This is for you if:**
+- You use Claude Code daily across multiple projects
+- You find yourself correcting Claude on the same things repeatedly
+- You have project-specific conventions that Claude keeps forgetting
+- You want Claude to learn your workflow, not just your words
+
+**This is NOT for you if:**
+- You use Claude Code once a week or less (not enough sessions for patterns to emerge)
+- Your sessions are short and simple (< 5 tool calls, nothing to learn from)
+- You don't want any background LLM calls (each session end makes 3-8 haiku/sonnet calls)
+- You want a vector database for semantic search (use [claude-mem](https://github.com/thedotmack/claude-mem) instead)
+
+The system needs ~5 sessions of data before it starts producing useful rules. It gets meaningfully better after ~20 sessions. If you're not going to give it that runway, it's overhead.
 
 ## Origin story
 
-This project was inspired by [Evolver](https://github.com/EvoMap/evolver) by the EvoMap team — a full-featured GEP (Gene Expression Programming) engine that enables AI agents to self-evolve their own code through mutation, validation, and solidification cycles.
+This project was inspired by [Evolver](https://github.com/EvoMap/evolver) by the EvoMap team — a GEP (Gene Expression Programming) engine that enables AI agents to self-evolve their own code.
 
-I originally wanted to use Evolver as-is, but quickly realized I didn't need a full autonomous self-evolution agent. What I actually needed was much simpler: **I wanted Claude Code to get better at working with me, session after session.**
+I originally wanted to use Evolver as-is, but realized I didn't need a full autonomous self-evolution agent. What I needed was simpler: **I wanted Claude Code to get better at working with me, session after session.**
 
-So I took the core ideas — genetic algorithms, fitness scoring, selection pressure, distillation — and applied them not to code evolution, but to **learning how a human works**. Every session becomes a selection event. Rules that help survive; rules that don't get pruned. Behavior patterns that repeat get reinforced. The "genome" isn't source code — it's each project's `CLAUDE.md`.
+So I took the core ideas — genetic algorithms, fitness scoring, selection pressure, distillation — and applied them not to code evolution, but to **learning how a human works**. Every session becomes a selection event. Rules that help survive; rules that don't get pruned. The "genome" isn't source code — it's each project's `CLAUDE.md`.
 
-The result is a system where Claude Code learns and self-corrects through every interaction. It adds what works, removes what doesn't, and gets a little better each time.
-
-Huge thanks to the Evolver / EvoMap team for the original vision and architecture. This project wouldn't exist without their work.
+Huge thanks to the Evolver / EvoMap team for the original vision. This project wouldn't exist without their work.
 
 ## How it works
 
@@ -25,39 +57,37 @@ Hooks observe every session:
   - What patterns repeat across sessions
         ↓
 Background LLM analysis (haiku for fast, sonnet for complex):
-  - Extract rules from corrections
-  - Detect behavior patterns and anti-patterns from observations
-  - Check for conflicts with hand-written rules
+  - Detect anti-patterns from the session timeline
+  - Extract rules from explicit corrections
+  - Learn behavior patterns across sessions
+  - Check for conflicts with your hand-written rules
   - Prune rules that don't help
         ↓
 Auto-writes to your project's CLAUDE.md
 Session compressed into persistent memory
         ↓
-Next session: Claude follows learned rules + has session history context
+Next session: Claude follows learned rules + has session history
 ```
 
 ## Key features
 
-### Observation-based learning
-Records full tool input/output (not just tool names). The LLM sees what you actually did — file paths, query content, edit patterns — and extracts actionable rules from real behavior.
-
 ### Anti-pattern detection
-Spots mistakes and suboptimal behaviors (e.g., editing without reading first, running queries without dry-run). Creates corrective rules automatically.
+Watches the full session timeline and spots suboptimal behaviors — editing without reading, querying without dry-run, repetitive file opens. Creates corrective rules without you saying a word.
+
+### Observation-based learning
+Records full tool input/output (not just tool names). The LLM sees what you actually did and extracts actionable rules from real behavior.
 
 ### Darwinian rule evolution
 Rules have fitness scores. Clean sessions = +1. Re-corrections on the same topic = -2. Low-fitness rules get pruned. Strong rules survive.
 
-### Session memory
-Every session is compressed into a structured `.md` file with summary, key decisions, and full observation timeline. An index provides quick context at session start.
+### Strategy selection
+Each session is classified (repair / reinforce / explore / distill) and processed accordingly — not every session gets the same treatment.
 
-### Progressive disclosure
-Session-start injects only a compact index + stats (Tier 1). Detailed context is available on-demand, not dumped into every prompt.
+### Session memory
+Every session is compressed into a structured `.md` file with summary, key decisions, and full observation timeline. A compact index is injected at session start.
 
 ### Conflict detection
 New auto-learned rules are checked against your hand-written `CLAUDE.md`. Conflicts become alerts — your rules are never overwritten.
-
-### Strategy selection
-Each session is classified (repair / reinforce / explore / distill) and processed accordingly.
 
 ### Periodic reflection
 Every 5 sessions, the system meta-analyzes its own rules: what's working, what's failing, what should be merged or removed.
@@ -67,32 +97,21 @@ Every 5 sessions, the system meta-analyzes its own rules: what's working, what's
 ### Quick setup (recommended)
 
 ```bash
-git clone https://github.com/YOUR_USER/claude-evolve.git
+git clone https://github.com/jack60810/claude-evolve.git
 cd claude-evolve
 node setup.js
 ```
 
 That's it. The setup script automatically:
-- Detects your `claude-evolve` install path
-- Adds hooks to `~/.claude/settings.json` (merges with existing settings)
+- Detects your install path
+- Adds hooks to `~/.claude/settings.json` (merges with existing settings, never overwrites)
 - Creates the data directory
-- Verifies claude CLI is available
+- Verifies claude CLI and Node.js are available
 
-### Verify installation
+### Verify
 
 ```bash
 node setup.js --check
-```
-
-You should see all checks pass:
-```
-  ✓ SessionStart → node /path/to/claude-evolve/learning/hooks/session-start.js
-  ✓ PostToolUse → node /path/to/claude-evolve/learning/hooks/post-tool.js
-  ✓ Stop → node /path/to/claude-evolve/learning/hooks/session-end.js
-  ✓ claude CLI → /usr/local/bin/claude
-  ✓ Node.js v22.0.0
-
-All checks passed. ✓
 ```
 
 ### Uninstall
@@ -101,12 +120,10 @@ All checks passed. ✓
 node setup.js --remove
 ```
 
-Removes all claude-evolve hooks from settings. Your learned rules in `CLAUDE.md` and data in `learning/data/` are preserved.
-
-### Manual setup (if you prefer)
+Removes hooks from settings. Your learned rules in `CLAUDE.md` and data in `learning/data/` are preserved.
 
 <details>
-<summary>Click to expand manual instructions</summary>
+<summary>Manual setup (if you prefer editing JSON)</summary>
 
 Add these hooks to `~/.claude/settings.json`. If you already have hooks, merge the entries into the existing arrays.
 
@@ -174,7 +191,7 @@ These are yours. claude-evolve will never modify them.
 - Always check existing definitions before writing new queries
 <!-- /evolver:rule -->
 
-<!-- evolver:rule id=r_def fitness=8 created=2026-04-15 source=behavior -->
+<!-- evolver:rule id=r_def fitness=8 created=2026-04-15 source=observation -->
 - After each Edit, run a validation step before moving to the next modification
 <!-- /evolver:rule -->
 
@@ -193,11 +210,20 @@ Each session end triggers a background process:
 2. **Rule extraction** (haiku) — extract actionable rules from corrections
 3. **Conflict check** (haiku) — compare against hand-written CLAUDE.md
 4. **Fitness evaluation** (haiku) — match corrections to existing rules
-5. **Observation analysis** (sonnet) — detect patterns and anti-patterns from full session timeline
+5. **Observation analysis** (sonnet) — detect patterns and anti-patterns from full timeline
 6. **Pruning** — remove rules with fitness < -3 after 5+ sessions
-7. **Distillation** (sonnet) — merge similar rules
+7. **Distillation** (sonnet) — merge similar rules into sharper versions
 8. **Reflection** (sonnet, every 5 sessions) — meta-analysis of what works
 9. **Session compression** (sonnet) — compress observations into persistent memory
+
+## How fitness works
+
+| Event | Fitness change |
+|-------|---------------|
+| Session with no re-correction | +1 |
+| Same topic corrected again (high confidence) | -2 |
+| Same topic corrected again (medium confidence) | -1 |
+| **Pruning threshold** | fitness < -3 AND sessions >= 5 |
 
 ## Three-tier session memory
 
@@ -206,29 +232,6 @@ Each session end triggers a background process:
 | **1. Index** | One line per session in `index.md` | Injected at every session-start |
 | **2. Summary** | Bullet points + key decisions | On-demand (search/recall) |
 | **3. Full** | Complete tool observation timeline | Debugging / deep analysis |
-
-## Data files
-
-All data in `learning/data/`:
-
-| File | Purpose |
-|------|---------|
-| `rules.json` | Rule database with fitness scores |
-| `changelog.jsonl` | All rule changes (add, prune, distill, reflect) |
-| `conflicts.json` | Pending conflict alerts |
-| `memory/index.md` | Session index (Tier 1) |
-| `memory/sessions/*.md` | Session memory files (Tier 2+3) |
-| `session_counter.json` | Per-project session count |
-| `session_log.jsonl` | Tool usage statistics |
-| `user_profile.json` | Aggregated user profile |
-
-## Exploration (manual)
-
-Scan a project for stale rules and drift:
-
-```bash
-node learning/exploration.js /path/to/your/project
-```
 
 ## Architecture
 
@@ -246,22 +249,15 @@ learning/
 ├── sessionMemory.js       — Three-tier session memory (index/summary/full)
 ├── exploration.js         — Stale rule and drift detection
 ├── analyzer.js            — Session statistics aggregation
+├── setup.js               — One-command install/check/uninstall
 └── genes.json             — Learning signal definitions
 ```
-
-## How fitness works
-
-| Event | Fitness change |
-|-------|---------------|
-| Session with no re-correction | +1 |
-| Same topic corrected again (high confidence) | -2 |
-| Same topic corrected again (medium confidence) | -1 |
-| **Pruning threshold** | fitness < -3 AND sessions >= 5 |
 
 ## Requirements
 
 - [Claude Code](https://claude.com/claude-code) CLI
 - Node.js >= 18
+- No npm dependencies (zero install, just clone and run)
 
 ## Acknowledgments
 
