@@ -43,7 +43,7 @@ function main() {
         const projectPath = process.cwd();
         const activeRules = ruleEngine.getActiveRules(projectPath);
         if (activeRules.length > 0) {
-          sections.push(`[Evolver] ${activeRules.length} active rules (see CLAUDE.md auto-learned section)`);
+          sections.push(`[claude-evolve] ${activeRules.length} active rules (see CLAUDE.md auto-learned section)`);
         }
       } catch {}
 
@@ -54,7 +54,7 @@ function main() {
         const conflicts = ruleEngine.getPendingConflicts(projectPath);
 
         if (conflicts.length > 0) {
-          sections.push('⚠️ [Evolver Conflict Alert]');
+          sections.push('⚠️ [claude-evolve Conflict Alert]');
           sections.push('The following auto-learned rules conflict with hand-written CLAUDE.md:');
           for (const c of conflicts) {
             sections.push(`- New rule: "${c.new_content}"`);

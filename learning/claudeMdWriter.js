@@ -5,14 +5,14 @@
 const fs = require('fs');
 const path = require('path');
 
-const MANAGED_START = '<!-- evolver:managed-start -->';
-const MANAGED_END = '<!-- evolver:managed-end -->';
+const MANAGED_START = '<!-- claude-evolve:managed-start -->';
+const MANAGED_END = '<!-- claude-evolve:managed-end -->';
 
 function ruleTag(rule) {
   const score = rule.score != null ? rule.score : (rule.fitness != null ? rule.fitness : 5);
-  return `<!-- evolver:rule id=${rule.id} score=${score} created=${rule.created} source=${rule.source} -->`;
+  return `<!-- claude-evolve:rule id=${rule.id} score=${score} created=${rule.created} source=${rule.source} -->`;
 }
-const RULE_END = '<!-- /evolver:rule -->';
+const RULE_END = '<!-- /claude-evolve:rule -->';
 
 // --- Read ---
 

@@ -111,7 +111,7 @@ function explore(projectPath) {
   // 1. Stale rules
   findings.staleRules = findStaleRules(projectPath).map(r => ({
     id: r.id, content: r.content.slice(0, 100),
-    last_evaluated: r.last_evaluated, fitness: r.fitness,
+    last_evaluated: r.last_evaluated, score: r.score || r.fitness,
   }));
 
   // 2. Git activity
@@ -142,7 +142,7 @@ if (require.main === module) {
   if (findings.staleRules.length > 0) {
     console.log(`\n[Stale Rules] ${findings.staleRules.length} rules not evaluated in 14+ days:`);
     for (const r of findings.staleRules) {
-      console.log(`  ${r.id}: ${r.content} (fitness=${r.fitness}, last=${r.last_evaluated})`);
+      console.log(`  ${r.id}: ${r.content} (score=${r.score || r.fitness}, last=${r.last_evaluated})`);
     }
   }
 

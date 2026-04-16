@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// ruleEngine.js — Rule population engine (evolver-style)
+// ruleEngine.js — Rule population engine (signal-gene pipeline)
 //
 // Population:
 //   active  — in CLAUDE.md, evaluated by LLM each session

@@ -216,7 +216,7 @@ Reply with ONLY this JSON (no markdown, no explanation):
 
 /**
  * Check if a new user correction is about the same topic as an existing auto-learned rule.
- * Used for fitness evaluation.
+ * Used for score evaluation.
  * Returns: { matches: [{ rule_id: string, confidence: 'high' | 'medium' | 'none' }] }
  */
 function matchCorrections(correctionTexts, existingRules) {
@@ -261,7 +261,7 @@ function tryDistill(rules) {
   if (rules.length < 3) return { should_distill: false };
 
   const rulesDesc = rules.map(r =>
-    `[${r.id}] (fitness=${r.fitness}) ${r.content}`
+    `[${r.id}] (score=${r.score || 5}) ${r.content}`
   ).join('\n');
 
   const prompt = `You are a rule consolidation engine. Given these auto-learned rules, determine if any group of 3+ rules can be merged into a single, more concise rule.
@@ -424,7 +424,7 @@ function reflectOnRules(activeRules, recentNarratives, recentChangelog) {
   if (!activeRules || activeRules.length === 0) return { insights: [] };
 
   const rulesDesc = activeRules.map(r =>
-    `[${r.id}] fitness=${r.fitness} sessions=${r.sessions_evaluated} src=${r.source} | ${r.content.slice(0, 120)}`
+    `[${r.id}] score=${r.score || 5} sessions=${r.sessions_evaluated} src=${r.source} | ${r.content.slice(0, 120)}`
   ).join('\n');
 
   const narrativeDesc = (recentNarratives || []).slice(-5).map(n =>
@@ -447,7 +447,7 @@ RECENT CHANGES:
 ${changeDesc}
 
 For each insight, suggest one action:
-- "keep": rule is working well (high fitness, no issues)
+- "keep": rule is working well (high score, no issues)
 - "revise": rule is partially right but needs rewording (explain how)
 - "merge": two+ rules overlap and should be combined
 - "remove": rule is not useful or contradicts reality
@@ -609,7 +609,7 @@ Reply JSON only:
   return askClaudeWithRetry(prompt, 35000, 'smart');
 }
 
-// ===================== Evolver-style Operators =====================
+// ===================== Signal-Gene Operators =====================
 
 /**
  * Evaluate all active rules in one LLM call.
@@ -712,7 +712,7 @@ module.exports = {
   analyzeObservations,
   compressSession,
   checkConflictBatch,
-  // Evolver-style operators
+  // Signal-gene operators
   triage,
   evaluateRuleSet,
   cleanupRules,

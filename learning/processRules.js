@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// processRules.js — Evolver-style learning pipeline
+// processRules.js — Signal-gene learning pipeline
 //
 // Signal → Gene → LLM Execute → Validate → Solidify
 //

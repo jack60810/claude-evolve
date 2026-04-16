@@ -265,10 +265,19 @@ function generateContext(profilePath, cwd) {
 
 function detectProject(cwd) {
   if (!cwd) return 'unknown';
-  const githubIdx = cwd.indexOf('Documents/GitHub/');
-  if (githubIdx === -1) return path.basename(cwd);
-  const rel = cwd.slice(githubIdx + 'Documents/GitHub/'.length);
-  // Return first two path segments (e.g., "MyProject/subdir")
+  // Find the code directory root (/GitHub/, /Projects/, /repos/, etc.)
+  const markers = ['/GitHub/', '/Projects/', '/repos/', '/src/'];
+  let bestIdx = -1;
+  let markerLen = 0;
+  for (const m of markers) {
+    const idx = cwd.indexOf(m);
+    if (idx !== -1 && (bestIdx === -1 || idx < bestIdx)) {
+      bestIdx = idx;
+      markerLen = m.length;
+    }
+  }
+  if (bestIdx === -1) return path.basename(cwd);
+  const rel = cwd.slice(bestIdx + markerLen);
   const parts = rel.split('/').filter(Boolean);
   return parts.slice(0, 2).join('/') || parts[0] || 'unknown';
 }
