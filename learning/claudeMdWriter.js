@@ -9,7 +9,8 @@ const MANAGED_START = '<!-- evolver:managed-start -->';
 const MANAGED_END = '<!-- evolver:managed-end -->';
 
 function ruleTag(rule) {
-  return `<!-- evolver:rule id=${rule.id} fitness=${rule.fitness} created=${rule.created} source=${rule.source} -->`;
+  const score = rule.score != null ? rule.score : (rule.fitness != null ? rule.fitness : 5);
+  return `<!-- evolver:rule id=${rule.id} score=${score} created=${rule.created} source=${rule.source} -->`;
 }
 const RULE_END = '<!-- /evolver:rule -->';
 
