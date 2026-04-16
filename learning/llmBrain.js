@@ -358,35 +358,56 @@ No patterns? Reply: {"patterns": []}`;
 }
 
 /**
- * Select a processing strategy based on session characteristics.
- * Returns: { strategy: 'repair'|'reinforce'|'explore'|'distill', reason: string, params: {} }
+ * Triage: LLM determines what happened, which gene to run, and complexity.
+ * One cheap haiku call replaces both signal extraction and gene selection.
+ * Complexity determines which model handles the gene execution.
+ *
+ * @param {Array} observations - Session timeline
+ * @param {Array} newMemories - Correction memories
+ * @param {number} activeRuleCount - Current active rules
+ * @param {number} sessionCount - Total sessions so far
+ * @returns {{ gene: string, complexity: 'routine'|'complex', reason: string }}
  */
-function selectStrategy(sessionBehavior, newMemories, recentSessions, existingRules) {
-  const memCount = (newMemories || []).length;
-  const ruleCount = (existingRules || []).length;
-  const sessionCount = (recentSessions || []).length;
-  const toolCalls = sessionBehavior ? sessionBehavior.toolCalls : 0;
+function triage(observations, newMemories, activeRuleCount, sessionCount) {
+  const corrCount = (newMemories || []).length;
+  const obsCount = (observations || []).length;
 
-  const prompt = `Strategy selector for a learning system. Pick ONE strategy for this session.
+  const toolSummary = {};
+  for (const obs of (observations || []).slice(-30)) {
+    toolSummary[obs.tool] = (toolSummary[obs.tool] || 0) + 1;
+  }
 
-Strategies:
-- "repair": User made corrections this session. Focus on fixing/adding rules from corrections. Be aggressive with new rules.
-- "reinforce": No corrections, user iterated productively. Strengthen existing rules (+fitness). Cautiously observe behavior patterns.
-- "explore": Session looks different from recent history (new tools, new workflow). Observe only, don't create rules yet — wait for patterns to repeat.
-- "distill": Many active rules accumulated, system is stable. Focus on merging and simplifying rules.
+  const corrNames = (newMemories || []).map(m => m.name || m.description || '').join(', ');
 
-SESSION DATA:
-- Corrections this session: ${memCount}
-- Tool calls: ${toolCalls}
-- Active rules: ${ruleCount}
-- Past sessions in history: ${sessionCount}
-- Workflow phases: ${sessionBehavior ? sessionBehavior.workflowPhases.join('→') : 'unknown'}
-- DB tables: ${sessionBehavior ? (sessionBehavior.dbTables || []).join(', ') || 'none' : 'unknown'}
+  const prompt = `Session triage. Determine what happened and what to do.
+
+SESSION:
+- Tool calls: ${obsCount}
+- Tools used: ${JSON.stringify(toolSummary)}
+- Corrections: ${corrCount}${corrCount > 0 ? ' (' + corrNames.slice(0, 200) + ')' : ''}
+- Active rules: ${activeRuleCount}
+- Session number: ${sessionCount}
+
+Pick ONE gene:
+- "repair": corrections exist → extract rules from what the user corrected
+- "innovate": no corrections but significant work (5+ tool calls) → find patterns and anti-patterns from behavior
+- "optimize": no corrections, periodic check → evaluate existing rules, score and demote bad ones
+- "cleanup": 8+ active rules → merge, simplify, remove redundant rules
+- "observe": trivial session (< 3 tool calls) → just record, do nothing
+
+Pick complexity:
+- "routine": simple correction, minor observation, standard cleanup
+- "complex": fundamental methodology change, new workflow pattern, conflicting corrections, major rule restructuring
 
 Reply JSON only:
-{"strategy": "<one of: repair|reinforce|explore|distill>", "reason": "<one sentence>"}`;
+{"gene": "repair|innovate|optimize|cleanup|observe", "complexity": "routine|complex", "reason": "<one sentence>"}`;
 
-  return askClaudeWithRetry(prompt, 25000);
+  return askClaudeWithRetry(prompt, 20000, 'fast');
+}
+
+// Legacy compat
+function selectStrategy(sessionBehavior, newMemories, recentSessions, existingRules) {
+  return triage([], newMemories, (existingRules || []).length, (recentSessions || []).length);
 }
 
 /**
@@ -687,6 +708,7 @@ module.exports = {
   compressSession,
   checkConflictBatch,
   // Evolver-style operators
+  triage,
   evaluateRuleSet,
   cleanupRules,
 };

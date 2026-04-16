@@ -26,36 +26,17 @@ function log(msg) {
 }
 
 // =====================================================================
-// SIGNAL EXTRACTION (no LLM — simple heuristics)
+// TRIAGE FALLBACK (if LLM triage fails, use simple heuristics)
 // =====================================================================
 
-function extractSignals(newMemories, observations, activeRuleCount) {
-  const signals = [];
-
-  if ((newMemories || []).length > 0) signals.push('correction');
-  if ((observations || []).length >= 5) signals.push('significant_session');
-  if ((observations || []).length >= 3) signals.push('has_observations');
-  if (activeRuleCount >= 8) signals.push('many_rules');
-  if (activeRuleCount === 0) signals.push('empty');
-
-  return signals;
-}
-
-// =====================================================================
-// GENE SELECTION (no LLM — signal matching)
-// =====================================================================
-
-function selectGene(signals, sessionCount) {
-  // Priority order: repair > innovate > optimize > cleanup
-  if (signals.includes('correction')) return 'repair';
-  if (signals.includes('has_observations') && signals.includes('empty')) return 'repair'; // Bootstrap: treat observations as repairs when empty
-  if (signals.includes('has_observations')) return 'innovate';
-  if (signals.includes('many_rules')) return 'cleanup';
-
-  // Periodic optimize: every 3 sessions without corrections
-  if (sessionCount > 0 && sessionCount % 3 === 0) return 'optimize';
-
-  return 'observe'; // Just record, don't act
+function fallbackTriage(newMemories, observations, activeRuleCount, sessionCount) {
+  let gene = 'observe';
+  if ((newMemories || []).length > 0) gene = 'repair';
+  else if ((observations || []).length >= 3 && activeRuleCount === 0) gene = 'repair';
+  else if ((observations || []).length >= 5) gene = 'innovate';
+  else if (activeRuleCount >= 8) gene = 'cleanup';
+  else if (sessionCount > 0 && sessionCount % 3 === 0) gene = 'optimize';
+  return { gene, complexity: 'routine', reason: 'fallback heuristic' };
 }
 
 // =====================================================================
@@ -87,10 +68,29 @@ async function main() {
   const stats = ruleEngine.getPopulationStats(project);
   log(`Session #${sessionCount} | active=${stats.active} dormant=${stats.dormant} dead=${stats.dead}`);
 
-  // --- Signal ---
-  const signals = extractSignals(newMemories, observations, stats.active);
-  const gene = selectGene(signals, sessionCount);
-  log(`Signals: [${signals.join(', ')}] → Gene: ${gene}`);
+  // --- Triage: LLM decides gene + complexity ---
+  let gene = 'observe';
+  let complexity = 'routine';
+  try {
+    const triageResult = llmBrain.triage(observations, newMemories, stats.active, sessionCount);
+    if (triageResult && triageResult.gene) {
+      gene = triageResult.gene;
+      complexity = triageResult.complexity || 'routine';
+      log(`Triage (LLM): gene=${gene} complexity=${complexity} — ${triageResult.reason || ''}`);
+    } else {
+      const fb = fallbackTriage(newMemories, observations, stats.active, sessionCount);
+      gene = fb.gene; complexity = fb.complexity;
+      log(`Triage (fallback): gene=${gene}`);
+    }
+  } catch (err) {
+    const fb = fallbackTriage(newMemories, observations, stats.active, sessionCount);
+    gene = fb.gene; complexity = fb.complexity;
+    log(`Triage error, using fallback: gene=${gene} — ${err.message || err}`);
+  }
+
+  // Model tier for gene execution: routine → haiku, complex → sonnet
+  const tier = complexity === 'complex' ? 'smart' : 'fast';
+  log(`Model tier: ${tier} (${complexity})`);
 
   let rulesAdded = 0;
   let conflictsFound = 0;
@@ -300,8 +300,8 @@ async function main() {
   // --- Log ---
   const finalStats = ruleEngine.getPopulationStats(project);
   ruleEngine.logChange({
-    action: 'session_complete', project, gene,
-    session: sessionCount, signals,
+    action: 'session_complete', project, gene, complexity,
+    session: sessionCount,
     rules_born: rulesAdded, conflicts: conflictsFound,
     population: finalStats,
   });
