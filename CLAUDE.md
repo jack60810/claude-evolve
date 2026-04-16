@@ -29,3 +29,17 @@
 <!-- /evolver:rule -->
 
 <!-- evolver:managed-end -->
+
+## Auto-learned Rules
+
+<!-- claude-evolve:managed-start -->
+
+<!-- claude-evolve:rule id=r_mo20mhnz_7jza score=5 created=2026-04-16 source=observation -->
+- When syncing files between two mirrored repos, use a loop with explicit path mapping and immediately verify both repos are identical after the copy (e.g., diff or checksum comparison).
+<!-- /claude-evolve:rule -->
+
+<!-- claude-evolve:rule id=r_mo20plpv_0znr score=5 created=2026-04-16 source=observation -->
+- When verifying a dependency's license, cross-check all three sources in parallel: local LICENSE file, package.json license field, and upstream GitHub API (`gh api repos/<owner>/<repo> --jq '.license.spdx_id'`) — conflicts between them require fetching the raw LICENSE file content to resolve definitively.
+<!-- /claude-evolve:rule -->
+
+<!-- claude-evolve:managed-end -->
