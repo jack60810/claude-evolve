@@ -159,6 +159,14 @@ function incrementSession(project) {
 
 function addRule(project, content, source, keywords, status) {
   const data = loadPopulation();
+
+  // Enforce MAX_ACTIVE: if requesting active but at cap, downgrade to candidate
+  let effectiveStatus = status || 'active';
+  if (effectiveStatus === 'active') {
+    const activeCount = data.population.filter(r => r.project === project && r.status === 'active').length;
+    if (activeCount >= MAX_ACTIVE) effectiveStatus = 'candidate';
+  }
+
   const id = generateId();
   const rule = {
     id, project, content, source,
@@ -167,7 +175,7 @@ function addRule(project, content, source, keywords, status) {
     relevance_count: 0,
     sessions_evaluated: 0,
     created: new Date().toISOString().slice(0, 10),
-    status: status || 'active',
+    status: effectiveStatus,
     dormant_since_session: 0,
   };
   data.population.push(rule);
