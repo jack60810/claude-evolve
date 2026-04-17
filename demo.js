@@ -125,6 +125,42 @@ function runPipeline(pendingPath, cwd) {
   });
 }
 
+/** Stream process.log so user sees pipeline activity live. */
+function tailProcessLog(sinceMtime) {
+  const logPath = path.join(LEARNING_ROOT, 'data', 'process.log');
+  if (!fs.existsSync(logPath)) return { stop: () => {} };
+
+  let lastSize = fs.existsSync(logPath) ? fs.statSync(logPath).size : 0;
+  let stopped = false;
+
+  const tick = () => {
+    if (stopped) return;
+    try {
+      const stat = fs.statSync(logPath);
+      if (stat.size > lastSize) {
+        const buf = Buffer.alloc(stat.size - lastSize);
+        const fd = fs.openSync(logPath, 'r');
+        fs.readSync(fd, buf, 0, buf.length, lastSize);
+        fs.closeSync(fd);
+        lastSize = stat.size;
+        const newLines = buf.toString('utf8').trim().split('\n').filter(Boolean);
+        for (const line of newLines) {
+          // Strip timestamp prefix and show interesting lines
+          const m = line.match(/^\[[^\]]+\]\s*(.+)$/);
+          const msg = m ? m[1] : line;
+          if (/Triage|Skillify|Promoted|Skill file|Added|Merged|Heuristic-score|Cross-project|Done/.test(msg)) {
+            console.log(`${colors.dim}       ${colors.magenta}↳${colors.dim} ${msg.slice(0, 100)}${colors.reset}`);
+          }
+        }
+      }
+    } catch {}
+    setTimeout(tick, 500);
+  };
+  tick();
+
+  return { stop: () => { stopped = true; } };
+}
+
 // ===================== Profession profile =====================
 
 function getProfession(name) {
@@ -252,25 +288,48 @@ async function main() {
 
   if (SEQUENTIAL) {
     for (let i = 1; i <= NUM_SESSIONS; i++) {
-      log(`Session ${i}/${NUM_SESSIONS}: generating...`);
+      log(`Session ${i}/${NUM_SESSIONS}: generating (model=${MODEL})...`);
+      const sT0 = Date.now();
       const s = await generateSessionAsync(profession, i, NUM_SESSIONS);
-      if (s) { sessions.push({ num: i, ...s }); ok(`  ${s.task_description || 'session'} (${s.observations.length} calls)`); }
-      else warn(`  session ${i} failed`);
+      const dt = ((Date.now() - sT0) / 1000).toFixed(0);
+      if (s) { sessions.push({ num: i, ...s }); ok(`  [${dt}s] ${s.task_description || 'session'} (${s.observations.length} calls)`); }
+      else warn(`  [${dt}s] session ${i} failed — will skip`);
     }
   } else {
-    log(`Launching ${NUM_SESSIONS} sessions in parallel...`);
+    log(`Launching ${NUM_SESSIONS} sessions in parallel (model=${MODEL}, ~${DEPTH} calls each)...`);
+    let completed = 0;
     const promises = [];
     for (let i = 1; i <= NUM_SESSIONS; i++) {
-      promises.push(generateSessionAsync(profession, i, NUM_SESSIONS).then(s => ({ num: i, ...s })));
+      const sT0 = Date.now();
+      const p = generateSessionAsync(profession, i, NUM_SESSIONS).then(s => {
+        completed++;
+        const dt = ((Date.now() - sT0) / 1000).toFixed(0);
+        if (s && s.observations) {
+          ok(`[${dt}s] (${completed}/${NUM_SESSIONS}) Session ${i}: ${(s.task_description || 'session').slice(0, 70)}`);
+          return { num: i, ...s };
+        } else {
+          warn(`[${dt}s] (${completed}/${NUM_SESSIONS}) Session ${i} failed`);
+          return { num: i };
+        }
+      });
+      promises.push(p);
     }
+    // Heartbeat while waiting
+    const heartbeat = setInterval(() => {
+      const elapsed = ((Date.now() - t0) / 1000).toFixed(0);
+      if (completed < NUM_SESSIONS) {
+        process.stdout.write(`${colors.dim}       ${colors.magenta}∙${colors.dim} waiting... ${completed}/${NUM_SESSIONS} done, ${elapsed}s elapsed${colors.reset}\r`);
+      }
+    }, 3000);
     const results = await Promise.all(promises);
+    clearInterval(heartbeat);
+    process.stdout.write('\r' + ' '.repeat(80) + '\r'); // clear heartbeat line
     for (const r of results) {
-      if (r && r.observations) { sessions.push(r); ok(`Session ${r.num}: ${r.task_description || 'session'} (${r.observations.length} calls)`); }
-      else warn(`Session ${r ? r.num : '?'} failed`);
+      if (r && r.observations) sessions.push(r);
     }
   }
   const genTime = ((Date.now() - t0) / 1000).toFixed(0);
-  log(`Generation took ${genTime}s total`);
+  log(`Generation phase done in ${genTime}s — ${sessions.length} sessions ready`);
 
   if (sessions.length === 0) {
     warn('No sessions generated. Check Claude CLI is installed and authenticated.');
@@ -279,14 +338,32 @@ async function main() {
 
   // Step 3: Run pipeline on each session (must be sequential — shared state)
   header(`Step 3 — Feed sessions through the learning pipeline`);
+  info(`  (pipeline output shown inline — watch what the system decides)`);
+
+  let prevRuleCount = 0;
   for (const s of sessions) {
-    log(`Session ${s.num}: processing ${s.observations.length} observations...`);
+    const pT0 = Date.now();
+    log(`Session ${s.num}: feeding ${s.observations.length} observations to pipeline...`);
     const pending = buildPending(DEMO_ROOT, s.observations);
     const pendingPath = path.join(DEMO_ROOT, `pending_${s.num}.json`);
     fs.writeFileSync(pendingPath, JSON.stringify(pending, null, 2), 'utf8');
+
+    // Tail process.log live during this pipeline run
+    const tail = tailProcessLog();
     runPipeline(pendingPath, DEMO_ROOT);
+    tail.stop();
+
+    const dt = ((Date.now() - pT0) / 1000).toFixed(0);
     const stats = ruleEngine.getPopulationStats(DEMO_ROOT);
-    ok(`  rules: ${stats.active} active, ${stats.dormant} dormant`);
+    const activeRules = ruleEngine.getActiveRules(DEMO_ROOT);
+    const newRules = activeRules.slice(prevRuleCount);
+    prevRuleCount = activeRules.length;
+
+    ok(`  [${dt}s] session ${s.num} done — ${stats.active} active rules (${newRules.length > 0 ? '+' + newRules.length : 'no new'})`);
+    for (const r of newRules.slice(0, 3)) {
+      console.log(`${colors.dim}       ${colors.green}+${colors.reset} ${colors.dim}${r.content.slice(0, 90)}${colors.reset}`);
+    }
+    if (newRules.length > 3) console.log(`${colors.dim}       ${colors.green}+${colors.reset} ${colors.dim}...and ${newRules.length - 3} more${colors.reset}`);
   }
 
   // Step 4: Mature + skillify
@@ -307,8 +384,13 @@ async function main() {
       { ts: Date.now(), tool: 'Read', input: 'README.md', output: '...' },
       { ts: Date.now() + 1, tool: 'Bash', input: 'echo', output: 'ok' },
     ]), null, 2), 'utf8');
-    log('Running skillify gene...');
+    log('Running skillify gene (this includes a sonnet call to generate the skill — takes ~60s)...');
+    const skT0 = Date.now();
+    const tail = tailProcessLog();
     runPipeline(bp, DEMO_ROOT);
+    tail.stop();
+    const skDt = ((Date.now() - skT0) / 1000).toFixed(0);
+    ok(`  skillify done in ${skDt}s`);
   } else if (active.length < 3) {
     warn(`Only ${active.length} rules extracted — need more sessions for a skill to form.`);
   }
