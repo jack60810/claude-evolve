@@ -1,45 +1,61 @@
 #!/usr/bin/env node
 // demo.js — See claude-evolve learn a profession's thinking model
 //
-// Pick any profession. The system will:
-//   1. Generate 6 realistic deep work sessions for that profession
-//   2. Observe the tool usage, extract patterns, score them
-//   3. Promote mature patterns to a .claude/skills/ methodology file
-//   4. Write a Skill Routing block into CLAUDE.md
-//
-// You'll see both files at the end — this is exactly what claude-evolve
-// would produce for a real user working in that profession.
+// Pick any profession. The system:
+//   1. Generates N realistic deep work sessions for that profession
+//   2. Observes tool usage, extracts patterns, scores them
+//   3. Promotes mature patterns to a .claude/skills/ methodology file
+//   4. Writes a Skill Routing block into CLAUDE.md
 //
 // Usage:
-//   node demo.js                    # defaults to analyst
-//   node demo.js ios-engineer
-//   node demo.js game-developer
-//   node demo.js random             # LLM picks a profession
+//   node demo.js analyst                      # defaults: 3 sessions, 8 tool calls each, parallel
+//   node demo.js ios-engineer --sessions=5    # more sessions = richer learning (slower)
+//   node demo.js game-dev --depth=12          # deeper sessions = more detail per task
+//   node demo.js random                       # LLM picks a profession
+//   node demo.js devops --sequential          # one at a time (slower but easier to follow)
 //
-// Cost: ~10-15 LLM calls (claude CLI) per run. Takes 10-15 minutes.
+// Flags:
+//   --sessions=N   Number of sessions to simulate (default 3, max 10)
+//   --depth=N      Tool calls per session (default 8, range 5-20)
+//   --sequential   Run sessions one at a time instead of parallel
+//   --model=X      "haiku" (fast, default) or "sonnet" (richer, slower)
 
 const fs = require('fs');
 const path = require('path');
-const { spawnSync } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const os = require('os');
 
 const LEARNING_ROOT = path.join(__dirname, 'learning');
-const PROFESSION = process.argv[2] || 'analyst';
+
+// ===================== Args =====================
+
+const args = process.argv.slice(2);
+const PROFESSION = args.find(a => !a.startsWith('--')) || 'analyst';
+function getFlag(name, def) {
+  const arg = args.find(a => a.startsWith(`--${name}=`));
+  return arg ? arg.split('=')[1] : def;
+}
+function hasFlag(name) { return args.includes(`--${name}`); }
+
+const NUM_SESSIONS = Math.min(10, Math.max(1, parseInt(getFlag('sessions', '3'), 10)));
+const DEPTH = Math.min(20, Math.max(5, parseInt(getFlag('depth', '8'), 10)));
+const SEQUENTIAL = hasFlag('sequential');
+const MODEL = getFlag('model', 'haiku');
 const DEMO_ROOT = path.join(__dirname, 'demo-output', `${PROFESSION}-${Date.now().toString(36)}`);
 
 // ===================== Pretty printing =====================
 
 const colors = {
   reset: '\x1b[0m', bold: '\x1b[1m', dim: '\x1b[2m',
-  cyan: '\x1b[36m', green: '\x1b[32m', yellow: '\x1b[33m', blue: '\x1b[34m',
+  cyan: '\x1b[36m', green: '\x1b[32m', yellow: '\x1b[33m',
+  blue: '\x1b[34m', magenta: '\x1b[35m',
 };
 
-function header(msg) {
-  console.log(`\n${colors.bold}${colors.cyan}━━━ ${msg} ━━━${colors.reset}\n`);
-}
+function header(msg) { console.log(`\n${colors.bold}${colors.cyan}━━━ ${msg} ━━━${colors.reset}\n`); }
 function log(msg) { console.log(`${colors.dim}  │${colors.reset} ${msg}`); }
 function ok(msg) { console.log(`${colors.green}  ✓${colors.reset} ${msg}`); }
 function warn(msg) { console.log(`${colors.yellow}  !${colors.reset} ${msg}`); }
+function info(msg) { console.log(`${colors.dim}${msg}${colors.reset}`); }
 
 // ===================== LLM helpers =====================
 
@@ -49,20 +65,57 @@ function findClaude() {
   return 'claude';
 }
 
-function askClaude(prompt, model) {
-  const result = spawnSync(findClaude(), [
-    '--print', '--model', model || 'sonnet',
-    '--system-prompt', 'You are a JSON generator. Output ONLY raw JSON — no markdown fences, no explanation.',
-    '--allowedTools', '', '--no-session-persistence', '--max-turns', '1',
-  ], {
-    input: prompt, encoding: 'utf8', timeout: 90000,
-    env: { ...process.env, EVOLVER_CHILD: '1' },
+/** Sync ask (blocking). Has retry + longer timeout. */
+function askClaude(prompt, model, retries) {
+  const maxRetries = retries || 2;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const result = spawnSync(findClaude(), [
+      '--print', '--model', model || MODEL,
+      '--system-prompt', 'You are a JSON generator. Output ONLY raw JSON — no markdown fences, no explanation.',
+      '--allowedTools', '', '--no-session-persistence', '--max-turns', '1',
+    ], {
+      input: prompt, encoding: 'utf8', timeout: 180000,
+      env: { ...process.env, EVOLVER_CHILD: '1' },
+    });
+    if (result.error) {
+      if (attempt < maxRetries) continue;
+      throw result.error;
+    }
+    const text = (result.stdout || '').trim();
+    const match = text.match(/```(?:json)?\s*([\s\S]*?)```/) || [null, text];
+    try { return JSON.parse(match[1].trim()); }
+    catch {
+      if (attempt < maxRetries) continue;
+      return null;
+    }
+  }
+  return null;
+}
+
+/** Async ask — returns a Promise. Used for parallel session generation. */
+function askClaudeAsync(prompt, model) {
+  return new Promise((resolve) => {
+    const child = spawn(findClaude(), [
+      '--print', '--model', model || MODEL,
+      '--system-prompt', 'You are a JSON generator. Output ONLY raw JSON — no markdown fences, no explanation.',
+      '--allowedTools', '', '--no-session-persistence', '--max-turns', '1',
+    ], { env: { ...process.env, EVOLVER_CHILD: '1' } });
+
+    let stdout = '';
+    let killed = false;
+    const timer = setTimeout(() => { killed = true; child.kill('SIGKILL'); }, 180000);
+
+    child.stdout.on('data', d => { stdout += d.toString(); });
+    child.stdin.write(prompt); child.stdin.end();
+    child.on('close', () => {
+      clearTimeout(timer);
+      if (killed) return resolve(null);
+      const text = stdout.trim();
+      const match = text.match(/```(?:json)?\s*([\s\S]*?)```/) || [null, text];
+      try { resolve(JSON.parse(match[1].trim())); } catch { resolve(null); }
+    });
+    child.on('error', () => { clearTimeout(timer); resolve(null); });
   });
-  if (result.error) throw result.error;
-  const text = (result.stdout || '').trim();
-  const match = text.match(/```(?:json)?\s*([\s\S]*?)```/) || [null, text];
-  try { return JSON.parse(match[1].trim()); }
-  catch { return null; }
 }
 
 function runPipeline(pendingPath, cwd) {
@@ -82,11 +135,10 @@ function getProfession(name) {
   log(`Asking LLM to define the profile for ${promptName}...`);
   const result = askClaude(`Define the profile for ${promptName}.
 
-Use only generic/public technology names (e.g., Swift, Xcode, Kubernetes, Postgres).
-Do NOT invent company-specific table names, proprietary systems, or internal codenames.
+Use only generic/public technology names. Keep it concise.
 
 Reply JSON only:
-{"name":"short-slug","title":"Full Title","context":"2-3 sentences about daily work","tools":["Tool (examples)"],"taskExamples":"6+ typical tasks"}`, 'sonnet');
+{"name":"short-slug","title":"Full Title","context":"2 sentences about daily work","tools":["Tool (examples)","..."],"taskExamples":"5 typical tasks, comma-separated"}`, 'haiku');
 
   if (result && result.name) {
     ok(`Profile: ${result.title}`);
@@ -97,29 +149,30 @@ Reply JSON only:
     name, title: name.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
     context: 'A software professional working in their domain.',
     tools: ['Bash', 'Read', 'Edit', 'Write', 'Grep'],
-    taskExamples: 'implement feature, fix bug, write tests, refactor, optimize, review',
+    taskExamples: 'implement feature, fix bug, write tests, refactor, optimize',
     tables: [],
   };
 }
 
 // ===================== Session generation =====================
 
-function generateSession(profession, num, total) {
-  const prompt = `Simulate a realistic work session for a ${profession.title}.
+function sessionPrompt(profession, num, total) {
+  return `Simulate a work session for a ${profession.title}.
 
 CONTEXT: ${profession.context}
 TOOLS: ${profession.tools.join(', ')}
 
-Generate 10-15 tool observations representing a deep multi-step work session.
-Task ${num}/${total}. Vary the task: ${profession.taskExamples}.
+Generate ${DEPTH} tool observations. Task ${num}/${total}. Vary the task: ${profession.taskExamples}.
 
-Include realistic patterns: investigation → mistakes → corrections → validation.
-Each observation: {tool, input (realistic command/file), output (realistic result), type?, tables?, isDryRun?}
+Each observation: {tool, input (realistic command or file path), output (realistic short output)}
+Include some real-world patterns: try → check → adjust → retry.
 
 Reply JSON only:
-{"task_description":"<what this session is about>","observations":[...]}`;
+{"task_description":"<one line>","observations":[{"tool":"Bash","input":"...","output":"..."},...]}`;
+}
 
-  const result = askClaude(prompt, 'sonnet');
+async function generateSessionAsync(profession, num, total) {
+  const result = await askClaudeAsync(sessionPrompt(profession, num, total), MODEL);
   if (!result || !result.observations) return null;
   const baseTs = Date.now() + num * 1000000;
   result.observations.forEach((obs, i) => { obs.ts = baseTs + i * 10000; });
@@ -170,117 +223,134 @@ async function main() {
 ║   claude-evolve demo — watch the system learn a profession   ║
 ╚══════════════════════════════════════════════════════════════╝${colors.reset}`);
 
-  console.log(`\n${colors.dim}Profession: ${colors.reset}${colors.bold}${PROFESSION}${colors.reset}`);
-  console.log(`${colors.dim}Output dir: ${DEMO_ROOT}${colors.reset}`);
-  console.log(`${colors.dim}Note: this makes ~10-15 Claude CLI calls. Takes 10-15 minutes.${colors.reset}\n`);
+  console.log(`\n${colors.dim}Profession:${colors.reset} ${colors.bold}${PROFESSION}${colors.reset}`);
+  console.log(`${colors.dim}Config:${colors.reset} ${NUM_SESSIONS} sessions × ${DEPTH} tool calls, ${SEQUENTIAL ? 'sequential' : 'parallel'} generation, model=${MODEL}`);
+  console.log(`${colors.dim}Output: ${DEMO_ROOT}${colors.reset}`);
+  const est = SEQUENTIAL ? NUM_SESSIONS * 3 : Math.ceil(NUM_SESSIONS / 2) + 2;
+  console.log(`${colors.dim}Estimated: ~${est} minutes${colors.reset}\n`);
 
-  // Setup
   fs.mkdirSync(DEMO_ROOT, { recursive: true });
   fs.writeFileSync(path.join(DEMO_ROOT, 'CLAUDE.md'),
     `# CLAUDE.md\n## Project\n${PROFESSION} workspace (demo)\n`);
 
-  // Clean any prior demo data for this project path
   const ruleEngine = require(path.join(LEARNING_ROOT, 'ruleEngine'));
   const data = ruleEngine.loadPopulation();
   data.population = data.population.filter(r => !r.project.includes('/demo-output/'));
   ruleEngine.savePopulation(data);
 
-  // Step 1: Profession profile
+  // Step 1: Profession
   header('Step 1 — Define the profession');
   const profession = getProfession(PROFESSION);
-  log(`${profession.context}`);
-  log(`Typical tasks: ${profession.taskExamples.slice(0, 100)}...`);
+  log(profession.context);
+  log(`Typical tasks: ${profession.taskExamples.slice(0, 100)}${profession.taskExamples.length > 100 ? '...' : ''}`);
 
-  // Step 2: Generate deep sessions
-  header('Step 2 — Simulate 6 deep work sessions');
-  const NUM = 6;
-  let succeeded = 0;
+  // Step 2: Generate sessions
+  header(`Step 2 — Simulate ${NUM_SESSIONS} work sessions (${SEQUENTIAL ? 'sequential' : 'parallel'})`);
 
-  for (let i = 1; i <= NUM; i++) {
-    log(`Session ${i}/${NUM}: generating observations...`);
-    const session = generateSession(profession, i, NUM);
-    if (!session) { warn(`Session ${i} generation failed, skipping`); continue; }
+  let sessions = [];
+  const t0 = Date.now();
 
-    log(`  task: ${session.task_description}`);
-    log(`  ${session.observations.length} tool calls — running pipeline...`);
+  if (SEQUENTIAL) {
+    for (let i = 1; i <= NUM_SESSIONS; i++) {
+      log(`Session ${i}/${NUM_SESSIONS}: generating...`);
+      const s = await generateSessionAsync(profession, i, NUM_SESSIONS);
+      if (s) { sessions.push({ num: i, ...s }); ok(`  ${s.task_description || 'session'} (${s.observations.length} calls)`); }
+      else warn(`  session ${i} failed`);
+    }
+  } else {
+    log(`Launching ${NUM_SESSIONS} sessions in parallel...`);
+    const promises = [];
+    for (let i = 1; i <= NUM_SESSIONS; i++) {
+      promises.push(generateSessionAsync(profession, i, NUM_SESSIONS).then(s => ({ num: i, ...s })));
+    }
+    const results = await Promise.all(promises);
+    for (const r of results) {
+      if (r && r.observations) { sessions.push(r); ok(`Session ${r.num}: ${r.task_description || 'session'} (${r.observations.length} calls)`); }
+      else warn(`Session ${r ? r.num : '?'} failed`);
+    }
+  }
+  const genTime = ((Date.now() - t0) / 1000).toFixed(0);
+  log(`Generation took ${genTime}s total`);
 
-    const pending = buildPending(DEMO_ROOT, session.observations);
-    const pendingPath = path.join(DEMO_ROOT, `pending_${i}.json`);
-    fs.writeFileSync(pendingPath, JSON.stringify(pending, null, 2), 'utf8');
-    runPipeline(pendingPath, DEMO_ROOT);
-
-    const stats = ruleEngine.getPopulationStats(DEMO_ROOT);
-    ok(`session ${i} done — active=${stats.active}, dormant=${stats.dormant}`);
-    succeeded++;
+  if (sessions.length === 0) {
+    warn('No sessions generated. Check Claude CLI is installed and authenticated.');
+    process.exit(1);
   }
 
-  // Step 3: Boost scores if needed, run skillify
-  header('Step 3 — Promote mature patterns to a skill');
+  // Step 3: Run pipeline on each session (must be sequential — shared state)
+  header(`Step 3 — Feed sessions through the learning pipeline`);
+  for (const s of sessions) {
+    log(`Session ${s.num}: processing ${s.observations.length} observations...`);
+    const pending = buildPending(DEMO_ROOT, s.observations);
+    const pendingPath = path.join(DEMO_ROOT, `pending_${s.num}.json`);
+    fs.writeFileSync(pendingPath, JSON.stringify(pending, null, 2), 'utf8');
+    runPipeline(pendingPath, DEMO_ROOT);
+    const stats = ruleEngine.getPopulationStats(DEMO_ROOT);
+    ok(`  rules: ${stats.active} active, ${stats.dormant} dormant`);
+  }
+
+  // Step 4: Mature + skillify
+  header('Step 4 — Promote mature patterns to a skill');
   const active = ruleEngine.getActiveRules(DEMO_ROOT);
   const mature = active.filter(r => (r.score || 0) > 7 && (r.relevance_count || 0) >= 5);
 
   if (mature.length < 3 && active.length >= 3) {
-    log(`Boosting ${active.length} rules to mature score (simulating extended use)`);
+    log(`Boosting ${active.length} rules (simulating extended real-world usage)`);
     const d = ruleEngine.loadPopulation();
     for (const r of d.population.filter(r => r.project === DEMO_ROOT && r.status === 'active')) {
       r.score = 8.5; r.relevance_count = 8; r.sessions_evaluated = 8;
     }
     ruleEngine.savePopulation(d);
 
-    const boostPending = buildPending(DEMO_ROOT, [
-      { ts: Date.now(), tool: 'Read', input: 'README.md', output: '...' },
-      { ts: Date.now() + 1, tool: 'Bash', input: 'echo done', output: 'done' },
-    ]);
     const bp = path.join(DEMO_ROOT, 'pending_boost.json');
-    fs.writeFileSync(bp, JSON.stringify(boostPending, null, 2), 'utf8');
+    fs.writeFileSync(bp, JSON.stringify(buildPending(DEMO_ROOT, [
+      { ts: Date.now(), tool: 'Read', input: 'README.md', output: '...' },
+      { ts: Date.now() + 1, tool: 'Bash', input: 'echo', output: 'ok' },
+    ]), null, 2), 'utf8');
     log('Running skillify gene...');
     runPipeline(bp, DEMO_ROOT);
+  } else if (active.length < 3) {
+    warn(`Only ${active.length} rules extracted — need more sessions for a skill to form.`);
   }
 
-  // Step 4: Show the outputs
-  header('Step 4 — What the system learned');
+  // Step 5: Show outputs
+  header('Step 5 — What the system learned');
 
   const claudeMdPath = path.join(DEMO_ROOT, 'CLAUDE.md');
   const skillDir = path.join(DEMO_ROOT, '.claude', 'skills');
 
-  console.log(`${colors.bold}${colors.green}▶ CLAUDE.md${colors.reset} ${colors.dim}(${claudeMdPath})${colors.reset}`);
+  console.log(`${colors.bold}${colors.green}▶ CLAUDE.md${colors.reset}`);
   console.log(`${colors.dim}${'─'.repeat(64)}${colors.reset}`);
   console.log(fs.readFileSync(claudeMdPath, 'utf8'));
-  console.log();
 
   if (fs.existsSync(skillDir)) {
-    const skills = fs.readdirSync(skillDir).filter(f => f.endsWith('.md'));
-    for (const s of skills) {
-      const skillPath = path.join(skillDir, s);
-      console.log(`${colors.bold}${colors.green}▶ .claude/skills/${s}${colors.reset} ${colors.dim}(${skillPath})${colors.reset}`);
+    for (const s of fs.readdirSync(skillDir).filter(f => f.endsWith('.md'))) {
+      console.log(`\n${colors.bold}${colors.green}▶ .claude/skills/${s}${colors.reset}`);
       console.log(`${colors.dim}${'─'.repeat(64)}${colors.reset}`);
-      console.log(fs.readFileSync(skillPath, 'utf8'));
-      console.log();
+      console.log(fs.readFileSync(path.join(skillDir, s), 'utf8'));
     }
-  } else {
-    warn('No skill file was generated. Try running again — LLM generation can fail.');
   }
 
   // Summary
   header('Summary');
   const finalStats = ruleEngine.getPopulationStats(DEMO_ROOT);
-  console.log(`  Profession:       ${profession.title}`);
-  console.log(`  Sessions run:     ${succeeded}/${NUM}`);
-  console.log(`  Rules extracted:  ${finalStats.active} active, ${finalStats.dormant} dormant`);
-  console.log(`  Skills generated: ${fs.existsSync(skillDir) ? fs.readdirSync(skillDir).filter(f => f.endsWith('.md')).length : 0}`);
-  console.log(`\n  Output kept at:   ${colors.blue}${DEMO_ROOT}${colors.reset}`);
-  console.log(`  ${colors.dim}(delete this directory when done — it's just for the demo)${colors.reset}`);
+  const totalTime = ((Date.now() - t0) / 1000).toFixed(0);
+  console.log(`  Profession:        ${profession.title}`);
+  console.log(`  Sessions:          ${sessions.length}/${NUM_SESSIONS} succeeded, ${DEPTH} tool calls each`);
+  console.log(`  Rules:             ${finalStats.active} active, ${finalStats.dormant} dormant`);
+  console.log(`  Skills:            ${fs.existsSync(skillDir) ? fs.readdirSync(skillDir).filter(f => f.endsWith('.md')).length : 0}`);
+  console.log(`  Total time:        ${totalTime}s`);
+  console.log(`\n  Output: ${colors.blue}${DEMO_ROOT}${colors.reset}`);
 
-  // Clean up rules from learning/data/rules.json so demo doesn't pollute real learning
+  // Clean up demo rules
   const d2 = ruleEngine.loadPopulation();
   d2.population = d2.population.filter(r => r.project !== DEMO_ROOT);
   ruleEngine.savePopulation(d2);
-  console.log(`\n  ${colors.green}✓${colors.reset} Demo rules removed from learning/data/rules.json`);
-  console.log(`  ${colors.dim}(your real project learning is untouched)${colors.reset}\n`);
+  console.log(`  ${colors.green}✓${colors.reset} Demo rules removed — your real learning is untouched\n`);
 }
 
 main().catch(err => {
   console.error(`\n${colors.yellow}✗ Demo failed:${colors.reset}`, err.message || err);
-  console.error(`${colors.dim}Output dir preserved for inspection: ${DEMO_ROOT}${colors.reset}\n`);
+  console.error(`${colors.dim}Output preserved: ${DEMO_ROOT}${colors.reset}\n`);
   process.exit(1);
 });
