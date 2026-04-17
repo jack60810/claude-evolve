@@ -43,8 +43,13 @@ function getHandWrittenContent(content) {
 
 // --- Build managed section ---
 
-function buildManagedSection(rules) {
-  if (!rules || rules.length === 0) return '';
+/**
+ * Build the managed section content for CLAUDE.md.
+ * @param {Array} rules - Non-methodology rules to write
+ * @param {Array} [skillRoutes] - Skill routing entries: [{ name, path, triggers, description }]
+ */
+function buildManagedSection(rules, skillRoutes) {
+  if ((!rules || rules.length === 0) && (!skillRoutes || skillRoutes.length === 0)) return '';
 
   const lines = [
     '',
@@ -53,6 +58,30 @@ function buildManagedSection(rules) {
     MANAGED_START,
     '',
   ];
+
+  // Skill routing: tell Claude Code when to use auto-generated skills
+  if (skillRoutes && skillRoutes.length > 0) {
+    lines.push('<!-- claude-evolve:skill-routing -->');
+    lines.push('### Skill Routing');
+    lines.push('');
+    lines.push('The following skills were auto-generated from observed work patterns. Use them when the trigger matches:');
+    lines.push('');
+    for (const route of skillRoutes) {
+      lines.push(`- **${route.name}** (.claude/skills/${route.name}.md): ${route.description}`);
+      if (route.triggers && route.triggers.length > 0) {
+        lines.push(`  Triggers: ${route.triggers.join(', ')}`);
+      }
+    }
+    lines.push('');
+    lines.push('When any of these triggers match, load and follow the corresponding skill before proceeding.');
+    lines.push('<!-- /claude-evolve:skill-routing -->');
+    lines.push('');
+  }
+
+  if (!rules || rules.length === 0) {
+    lines.push(MANAGED_END);
+    return lines.join('\n');
+  }
 
   for (const rule of rules) {
     lines.push(ruleTag(rule));
@@ -105,14 +134,21 @@ function buildManagedSection(rules) {
 
 // --- Write ---
 
-function writeRulesToClaudeMd(projectPath, rules) {
+/**
+ * Write rules (and optional skill routes) to CLAUDE.md.
+ * @param {string} projectPath
+ * @param {Array} rules - Non-methodology rules
+ * @param {Array} [skillRoutes] - Skill routing entries from skillWriter
+ */
+function writeRulesToClaudeMd(projectPath, rules, skillRoutes) {
   const { path: mdPath, content, exists } = readClaudeMd(projectPath);
-  const managedSection = buildManagedSection(rules);
+  const managedSection = buildManagedSection(rules, skillRoutes);
+  const hasContent = (rules && rules.length > 0) || (skillRoutes && skillRoutes.length > 0);
 
   let newContent;
 
   if (!exists) {
-    if (rules.length === 0) return null; // Nothing to write, no file to create
+    if (!hasContent) return null;
     newContent = '# CLAUDE.md\n' + managedSection + '\n';
   } else {
     const startIdx = content.indexOf(MANAGED_START);
@@ -120,7 +156,7 @@ function writeRulesToClaudeMd(projectPath, rules) {
 
     if (startIdx === -1 || endIdx === -1) {
       // No managed section yet — append
-      if (rules.length === 0) return null;
+      if (!hasContent) return null;
       newContent = content.trimEnd() + '\n' + managedSection + '\n';
     } else {
       // Find the section header (## Auto-learned Rules) before MANAGED_START

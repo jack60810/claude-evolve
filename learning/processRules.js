@@ -491,8 +491,24 @@ async function main() {
       log(`skillWriter error: ${err.message}, falling back to claudeMdWriter`);
       otherRules.push(...methodologyRules);
     }
-    const writtenPath = claudeMdWriter.writeRulesToClaudeMd(project, otherRules);
-    log(`Solidified: ${otherRules.length} rules → ${writtenPath || 'CLAUDE.md'}`);
+    // Build skill routes for CLAUDE.md so Claude Code knows when to use the skill
+    const skillRoutes = [];
+    const skillDir = path.join(project, '.claude', 'skills');
+    if (fs.existsSync(skillDir)) {
+      for (const f of fs.readdirSync(skillDir).filter(f => f.startsWith('auto-') && f.endsWith('.md'))) {
+        const skillContent = fs.readFileSync(path.join(skillDir, f), 'utf8');
+        const nameMatch = skillContent.match(/name:\s*"?([^"\n]+)"?/);
+        const descMatch = skillContent.match(/description:\s*\|?\s*\n?\s*([^\n]+)/);
+        const triggerMatches = [...skillContent.matchAll(/^\s+-\s*"?([^"\n]+)"?\s*$/gm)];
+        skillRoutes.push({
+          name: f.replace('.md', ''),
+          description: (descMatch ? descMatch[1].trim() : 'Auto-generated skill'),
+          triggers: triggerMatches.slice(0, 5).map(m => m[1].trim()),
+        });
+      }
+    }
+    const writtenPath = claudeMdWriter.writeRulesToClaudeMd(project, otherRules, skillRoutes);
+    log(`Solidified: ${otherRules.length} rules + ${skillRoutes.length} skill routes → ${writtenPath || 'CLAUDE.md'}`);
   } else {
     const writtenPath = claudeMdWriter.writeRulesToClaudeMd(project, finalActive);
     log(`Solidified: ${finalActive.length} rules → ${writtenPath || 'CLAUDE.md'}`);
