@@ -9,7 +9,7 @@ const os = require('os');
 
 /**
  * Encode a project path to the Claude Code memory directory path.
- * /Users/jack/Documents/GitHub/Down → -Users-jack-Documents-GitHub-Down
+ * /Users/alice/projects/myapp → -Users-alice-projects-myapp
  * Resolves symlinks (e.g., /tmp → /private/tmp on macOS) for consistent matching.
  */
 function encodeProjectPath(projectPath) {

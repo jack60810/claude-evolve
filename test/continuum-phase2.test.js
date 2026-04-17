@@ -370,7 +370,7 @@ describe('analyzer.classifyProjectType', () => {
   it('classifies as analysis when dbTables are present', () => {
     const sessionBehavior = {
       toolCounts: { Read: 10, Bash: 5 },
-      dbTables: ['amp.EVENTS_161970'],
+      dbTables: ['analytics.events'],
       mcpTools: [],
       dbDryRuns: 0,
     };
