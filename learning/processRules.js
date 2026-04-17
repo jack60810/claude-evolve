@@ -70,21 +70,9 @@ async function main() {
   const stats = ruleEngine.getPopulationStats(project);
   log(`Session #${sessionCount} | active=${stats.active} dormant=${stats.dormant} dead=${stats.dead}`);
 
-  // --- Count groups of 3+ related rules with score > 7 (for skillify) ---
-  let highScoreGroups = 0;
-  {
-    const checked = new Set();
-    for (const rule of activeRules) {
-      if (checked.has(rule.id) || (rule.score || 0) <= 7) continue;
-      const related = ruleEngine.getRelatedRules(project, rule, 0.2)
-        .filter(r => (r.score || 0) > 7);
-      if (related.length >= 2) {
-        highScoreGroups++;
-        checked.add(rule.id);
-        for (const r of related) checked.add(r.id);
-      }
-    }
-  }
+  // --- Count high-score rules for skillify (group by project type, not keyword) ---
+  const highScoreRules = activeRules.filter(r => (r.score || 0) > 7 && (r.relevance_count || 0) >= 5);
+  const highScoreGroups = highScoreRules.length >= 3 ? 1 : 0;
 
   // --- Triage: LLM decides gene + complexity ---
   let gene = 'observe';
@@ -307,44 +295,32 @@ async function main() {
   }
 
   if (gene === 'skillify') {
-    // Re-evaluate complexity for groups of related high-score rules
+    // P1: Group ALL high-score rules in this project as one methodology group.
+    // No keyword similarity needed — same project type = same methodology.
     const currentActive = ruleEngine.getActiveRules(project);
-    const data = ruleEngine.loadPopulation();
-    const processed = new Set();
+    const matureRules = currentActive.filter(r =>
+      (r.score || 0) > 7 && (r.relevance_count || 0) >= 5
+    );
 
-    for (const rule of currentActive) {
-      if (processed.has(rule.id) || (rule.score || 0) <= 7) continue;
-      if ((rule.relevance_count || 0) < 5) continue;
+    if (matureRules.length >= 3) {
+      log(`  Skillify: ${matureRules.length} mature rules in project → methodology`);
+      const data = ruleEngine.loadPopulation();
 
-      const related = ruleEngine.getRelatedRules(project, rule, 0.2)
-        .filter(r => (r.score || 0) > 7 && (r.relevance_count || 0) >= 5);
-
-      if (related.length < 2) continue; // need 3+ rules total
-
-      const group = [rule, ...related];
-      log(`  Skillify: found group of ${group.length} related high-score rules`);
-
-      // Deterministic promotion: 3+ related high-score rules = methodology
-      // No LLM call needed here — the group criteria IS the signal.
-      const newComplexity = group.length >= 5 ? 'methodology' :
-                            group.length >= 3 ? 'methodology' : 'workflow';
-
-      const levels = ['simple', 'compound', 'workflow', 'methodology'];
-      for (const r of group) {
-        const currentLevel = levels.indexOf(r.complexity || 'simple');
-        const newLevel = levels.indexOf(newComplexity);
-        if (newLevel > currentLevel) {
+      for (const r of matureRules) {
+        const currentLevel = ['simple', 'compound', 'workflow', 'methodology'].indexOf(r.complexity || 'simple');
+        if (currentLevel < 3) { // not yet methodology
           const popRule = data.population.find(x => x.id === r.id);
           if (popRule) {
-            popRule.complexity = newComplexity;
+            popRule.complexity = 'methodology';
             sessionRuleIds.add(r.id);
-            log(`  Promoted ${r.id.slice(0,12)}: ${r.complexity || 'simple'} → ${newComplexity}`);
+            log(`  Promoted ${r.id.slice(0,12)}: ${r.complexity || 'simple'} → methodology`);
           }
         }
-        processed.add(r.id);
       }
+      ruleEngine.savePopulation(data);
+    } else {
+      log(`  Skillify: only ${matureRules.length} mature rules (need 3+), skipping`);
     }
-    ruleEngine.savePopulation(data);
   }
 
   // gene === 'observe' → no LLM calls, just record
@@ -367,6 +343,28 @@ async function main() {
           ruleEngine.savePopulation(data);
         }
       }
+    }
+  }
+
+  // --- P2: Lightweight scoring every session (not just during optimize) ---
+  // Quick evaluation: let LLM score all active rules against this session's observations.
+  // This ensures rules accumulate scores naturally without waiting for triage to pick optimize.
+  if (gene !== 'optimize' && observations && observations.length >= 3) {
+    const scorableRules = ruleEngine.getActiveRules(project);
+    if (scorableRules.length > 0) {
+      try {
+        log(`Quick-score: evaluating ${scorableRules.length} rules against session...`);
+        const evalResult = llmBrain.evaluateRuleSet(scorableRules, observations, newMemories);
+        if (evalResult && Array.isArray(evalResult.evaluations)) {
+          const changes = ruleEngine.applyScores(project, evalResult.evaluations);
+          const meaningful = changes.filter(c => Math.abs(c.new_score - c.old_score) > 0.3);
+          if (meaningful.length > 0) {
+            for (const c of meaningful) {
+              log(`  Quick-score ${c.rule_id.slice(0, 12)}: ${c.old_score} → ${c.new_score}`);
+            }
+          }
+        }
+      } catch (err) { log(`Quick-score error: ${err.message}`); }
     }
   }
 
@@ -400,9 +398,17 @@ async function main() {
   const methodologyRules = finalActive.filter(r => r.complexity === 'methodology');
   const otherRules = finalActive.filter(r => r.complexity !== 'methodology');
 
+  // P4: Auto-learn — regenerate skill when rules change (new rules born, scores shift)
+  // A skill should always reflect the LATEST state of the methodology.
+  const shouldRegenSkill = skillWriter && methodologyRules.length > 0 && (
+    rulesAdded > 0 ||                    // New rules were born this session
+    gene === 'skillify' ||               // Skillify just promoted rules
+    gene === 'cleanup' ||                // Cleanup merged/rewrote rules
+    sessionRuleIds.size > 0              // Any rules were modified
+  );
+
   if (skillWriter && methodologyRules.length > 0) {
     try {
-      // Load user memories and session narratives for thinking-pattern inference
       let allMemories = [];
       let sessionNarratives = [];
       try {
@@ -417,21 +423,18 @@ async function main() {
         }
       } catch {}
 
-      // Group methodology rules by keyword similarity, write ONE skill per group
-      const grouped = new Set();
-      for (const rule of methodologyRules) {
-        if (grouped.has(rule.id)) continue;
-        const related = methodologyRules.filter(r =>
-          r.id !== rule.id && !grouped.has(r.id) &&
-          ruleEngine.jaccardSimilarity(r.keywords || [], rule.keywords || []) > 0.2
-        );
-        const result = skillWriter.writeSkill(project, rule, related, pending.projectType || '', allMemories, sessionNarratives);
+      if (shouldRegenSkill) {
+        // Regenerate: rules changed, skill needs to reflect latest state
+        log(`  Skill auto-update: regenerating (trigger: ${rulesAdded > 0 ? 'new rules' : gene === 'skillify' ? 'promotion' : 'rule changes'})`);
+        const primary = methodologyRules[0];
+        const related = methodologyRules.slice(1);
+        const result = skillWriter.writeSkill(project, primary, related, pending.projectType || '', allMemories, sessionNarratives);
         if (result && result.written) log(`  Skill file: ${result.path}`);
         else if (result) log(`  Skill skipped: ${result.reason || 'unknown'}`);
-        grouped.add(rule.id);
-        for (const r of related) grouped.add(r.id);
+      } else {
+        log(`  Skill unchanged (no rule changes this session)`);
       }
-      log(`Solidified: ${methodologyRules.length} methodology rules → ${grouped.size} skill groups`);
+      log(`Solidified: ${methodologyRules.length} methodology rules → skill`);
     } catch (err) {
       log(`skillWriter error: ${err.message}, falling back to claudeMdWriter`);
       otherRules.push(...methodologyRules);
@@ -439,96 +442,15 @@ async function main() {
     const writtenPath = claudeMdWriter.writeRulesToClaudeMd(project, otherRules);
     log(`Solidified: ${otherRules.length} rules → ${writtenPath || 'CLAUDE.md'}`);
   } else {
-    // No skillWriter or no methodology rules: all go to claudeMdWriter
-    if (methodologyRules.length > 0) {
-      // methodology rules fall back to claudeMdWriter as workflow blocks
-      log(`No skillWriter available, ${methodologyRules.length} methodology rules fall back to claudeMdWriter`);
-    }
     const writtenPath = claudeMdWriter.writeRulesToClaudeMd(project, finalActive);
     log(`Solidified: ${finalActive.length} rules → ${writtenPath || 'CLAUDE.md'}`);
   }
 
-  // --- Skill hints for session-start ---
-  try {
-    const hintsPath = path.join(DATA_DIR, 'skill_hints.json');
-    let hints = { hints: [] };
-    try { hints = JSON.parse(fs.readFileSync(hintsPath, 'utf8')); } catch {}
-
-    // Clean up shown hints
-    hints.hints = hints.hints.filter(h => !h.shown);
-
-    // Add hints for rules that just reached methodology level
-    for (const rule of methodologyRules) {
-      if (!hints.hints.some(h => h.pattern_id === rule.id)) {
-        const kw = (rule.keywords || []).slice(0, 3).join(', ');
-        hints.hints.push({
-          pattern_id: rule.id,
-          message: `Your ${kw} workflow is mature (${rule.sessions_evaluated || 0} sessions). A skill has been created.`,
-          shown: false,
-        });
-      }
-    }
-
-    const hintsTmp = hintsPath + '.tmp';
-    fs.writeFileSync(hintsTmp, JSON.stringify(hints, null, 2) + '\n', 'utf8');
-    fs.renameSync(hintsTmp, hintsPath);
-  } catch (err) {
-    log(`Skill hints error: ${err.message}`);
-  }
-
-  // --- Cross-project pattern store ---
-  try {
-    const XP_PATH = path.join(DATA_DIR, 'cross_project_patterns.json');
-    const projectType = (pending && pending.projectType) || 'general';
-
-    let xpStore;
-    try { xpStore = JSON.parse(fs.readFileSync(XP_PATH, 'utf8')); }
-    catch { xpStore = { version: 1, patterns: [] }; }
-
-    let xpAdded = 0;
-    let xpUpdated = 0;
-
-    for (const rule of finalActive) {
-      if ((rule.score || 0) <= 7) continue;
-      if ((rule.relevance_count || 0) < 5) continue;
-      const cplx = rule.complexity || 'simple';
-      if (cplx === 'simple') continue; // Only compound or higher
-
-      const ruleKeywords = rule.keywords || [];
-      const existing = xpStore.patterns.find(xp =>
-        ruleEngine.jaccardSimilarity(xp.keywords || [], ruleKeywords) > 0.5
-      );
-
-      if (existing) {
-        if ((rule.score || 0) > (existing.score || 0)) {
-          existing.score = rule.score;
-          existing.sessions_observed = (existing.sessions_observed || 0) + 1;
-          xpUpdated++;
-        }
-      } else {
-        xpStore.patterns.push({
-          id: 'xp_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6),
-          project_type: projectType,
-          source_project: project,
-          content: rule.content,
-          complexity: cplx,
-          score: rule.score,
-          keywords: ruleKeywords,
-          sessions_observed: rule.relevance_count || 0,
-          created: new Date().toISOString().slice(0, 10),
-        });
-        xpAdded++;
-      }
-    }
-
-    if (xpAdded > 0 || xpUpdated > 0) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-      const xpTmp = XP_PATH + '.tmp';
-      fs.writeFileSync(xpTmp, JSON.stringify(xpStore, null, 2) + '\n', 'utf8');
-      fs.renameSync(xpTmp, XP_PATH);
-      log(`Cross-project store: ${xpAdded} added, ${xpUpdated} updated`);
-    }
-  } catch (err) { log(`XP store error: ${err.message}`); }
+  // --- Skill hints + cross-project store (extracted to modules) ---
+  const skillHints = require('./skillHints');
+  const crossProjectStore = require('./crossProjectStore');
+  skillHints.updateHints(methodologyRules, log);
+  crossProjectStore.savePatterns(project, finalActive, (pending && pending.projectType) || 'general', log);
 
   // --- Session memory ---
   try {
