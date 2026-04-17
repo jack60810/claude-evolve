@@ -52,6 +52,20 @@ Skills live in `.claude/skills/auto-*.md`. They follow the standard Claude Code 
 
 Cross-project transfer: when you start a new project of the same type (e.g., another analysis project), the system suggests patterns it learned from your other projects.
 
+### Validated with real simulation
+
+We tested this by simulating 3 different analysts (Alice, Bob, Carol) doing 6 different analysis tasks (retention, funnel, segmentation, trends, churn, ARPU). Each analyst had a different style, but the system found their shared methodology automatically:
+
+```
+3 analysts × 2 tasks each = 6 sessions
+→ 10 rules extracted from observed behavior
+→ 1 skill generated capturing the common thinking model:
+  "Progressive commitment: spend minimum cost to validate at each stage
+   before committing to a larger, more expensive step."
+```
+
+No analyst explicitly taught these patterns. The system inferred them from tool usage sequences across sessions.
+
 ## When this helps / When it doesn't
 
 **This is for you if:**
