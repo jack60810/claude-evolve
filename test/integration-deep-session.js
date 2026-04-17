@@ -52,55 +52,50 @@ function runPipeline(pendingPath, projectDir) {
   return result;
 }
 
-// ===================== Profession Definitions =====================
+// ===================== Generate Profession via LLM =====================
 
-const PROFESSIONS = {
-  'analyst': {
-    title: 'Data Analyst',
-    context: 'Works with BigQuery (bq CLI), Amplitude event data (amp.EVENTS_161970), and prod_db_copy tables. Analyzes user behavior, retention, funnels, segmentation. Uses Python for sanity checks.',
-    tables: ['prod_db_copy.users', 'amp.EVENTS_161970', 'prod_db_copy.settings'],
-    tools: ['Bash (bq query, python3)', 'Read (SQL files, CSV)', 'Edit (SQL files)', 'Write (results, reports)'],
-    taskExamples: 'retention cohort analysis, funnel conversion, user segmentation, churn prediction, ARPU analysis, A/B test evaluation',
-  },
-  'backend-engineer': {
-    title: 'Backend Engineer',
-    context: 'Works with Node.js/Python APIs, PostgreSQL, Redis. Implements features, fixes bugs, writes tests. Uses git, npm/pip, curl for API testing.',
-    tables: [],
-    tools: ['Bash (git, npm, curl, docker)', 'Read (source code)', 'Edit (source code)', 'Write (new files)', 'Grep (search code)'],
-    taskExamples: 'implement REST endpoint, fix authentication bug, add database migration, write integration tests, refactor service layer, optimize slow query',
-  },
-  'devops': {
-    title: 'DevOps Engineer',
-    context: 'Manages GCP infrastructure, Docker containers, Airflow DAGs, CI/CD pipelines. Monitors logs, deploys services, manages secrets.',
-    tables: [],
-    tools: ['Bash (gcloud, docker, kubectl, terraform)', 'Read (config files, logs)', 'Edit (YAML configs, Dockerfiles)', 'Write (scripts, manifests)'],
-    taskExamples: 'deploy new service, investigate production incident, set up monitoring alert, migrate database, update CI pipeline, rotate secrets',
-  },
-  'frontend-engineer': {
-    title: 'Frontend Engineer',
-    context: 'Works with React/TypeScript, CSS, component libraries. Builds UI features, fixes layout bugs, optimizes performance.',
-    tables: [],
-    tools: ['Bash (npm, vitest, eslint)', 'Read (components, styles)', 'Edit (TSX, CSS)', 'Write (new components)', 'Grep (find usages)'],
-    taskExamples: 'build new dashboard page, fix responsive layout, add form validation, optimize bundle size, implement dark mode, add accessibility',
-  },
-};
-
-// ===================== Generate Profession (for random mode) =====================
-
+/**
+ * Generate a profession profile from a name. The profile is entirely
+ * LLM-generated — no hardcoded domain-specific data.
+ * Accepts any name: "analyst", "ios-engineer", "game-dev", "ml-researcher",
+ * "security-engineer", "mobile-qa", "blockchain-dev", or just "random".
+ */
 function getProfession(name) {
-  if (name === 'random') {
-    log('Asking LLM to pick a random profession...');
-    const result = askClaude(`Pick a random software-adjacent profession (not data analyst, not backend engineer, not devops, not frontend engineer). Something interesting and specific.
+  const promptName = name === 'random'
+    ? 'a random software-adjacent profession — something interesting and specific'
+    : `a "${name}"`;
 
-Reply JSON: {"name": "short-slug", "title": "Full Title", "context": "2-3 sentences about what they do daily, which tools they use, what data/systems they touch", "tools": ["Tool (examples)"], "taskExamples": "comma-separated list of 6 typical tasks"}`, 'haiku');
-    if (result && result.name) {
-      log(`Random profession: ${result.title}`);
-      return result;
-    }
-    log('Failed to generate random profession, falling back to analyst');
-    return PROFESSIONS['analyst'];
+  log(`Asking LLM to define the profession profile...`);
+  const result = askClaude(`Define the profile for ${promptName}.
+
+Return a realistic description of what they do daily — the tools they use, the
+systems they touch, the typical tasks they do. Use generic/public technology
+names only (e.g., Swift, Xcode, Kubernetes, Postgres). Do NOT invent
+company-specific table names, proprietary system names, or internal codenames.
+
+Reply JSON only:
+{
+  "name": "short-slug",
+  "title": "Full Title",
+  "context": "2-3 sentences about daily work, tools, systems",
+  "tools": ["Tool category (examples of commands/files)", "..."],
+  "taskExamples": "comma-separated list of 6+ typical task types"
+}`, 'sonnet');
+
+  if (result && result.name && result.context) {
+    log(`Profession: ${result.title}`);
+    return { ...result, tables: [] };
   }
-  return PROFESSIONS[name] || PROFESSIONS['analyst'];
+
+  log('Failed to generate profession profile, using generic fallback');
+  return {
+    name: name,
+    title: name.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
+    context: 'A software professional working in their domain.',
+    tools: ['Bash', 'Read', 'Edit', 'Write', 'Grep'],
+    taskExamples: 'implement feature, fix bug, write tests, review code, refactor, optimize performance',
+    tables: [],
+  };
 }
 
 // ===================== Generate Deep Sessions =====================

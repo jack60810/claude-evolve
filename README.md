@@ -74,36 +74,23 @@ Cross-project transfer: when you start a new project of the same type (e.g., ano
 
 ### Validated with deep simulation
 
-We tested this by simulating 5 deep analysis sessions (13-16 tool calls each) across different tasks: retention cohorts, onboarding funnels, A/B test evaluation, user segmentation. The system produced a skill called `auto-bq-safe-analysis`:
+The integration test simulates 6 deep multi-turn sessions for any profession. Each session has 10-16 tool calls representing realistic investigation, mistakes, corrections, and validation. The system should extract rules and eventually form a skill that captures the user's thinking model — not just their steps.
 
-```markdown
-## Thinking Model
-
-This user's core mental model is cost-aware, correctness-first analytics.
-
-What they care about most, in order: (1) cost safety, (2) correctness, (3) speed.
-
-Never run a full query without dry_run. If estimated bytes > 100 GB, don't ask —
-just tighten the filter and re-run. If sub-group totals don't add up, flag it
-before moving on.
-
-## What NOT to Do
-- Never skip dry_run, even for "quick" queries
-- Never present A/B results with just one metric — compute the full significance block
-- Never skip notes.md at the end of an analysis
-```
-
-No one explicitly taught these patterns. The system inferred them from tool usage sequences, user corrections (feedback memories), and cross-session consistency.
-
-The test is parameterized for any profession:
+The profession profile is entirely LLM-generated. Pass any name:
 
 ```bash
-node test/integration-deep-session.js analyst          # data analyst (default)
-node test/integration-deep-session.js backend-engineer  # backend dev
-node test/integration-deep-session.js devops            # devops/infra
-node test/integration-deep-session.js frontend-engineer # frontend dev
-node test/integration-deep-session.js random            # LLM picks a random profession
+node test/integration-deep-session.js analyst
+node test/integration-deep-session.js backend-engineer
+node test/integration-deep-session.js ios-engineer
+node test/integration-deep-session.js game-developer
+node test/integration-deep-session.js security-researcher
+node test/integration-deep-session.js random            # LLM picks one
 ```
+
+For each profession, the generated skill captures domain-specific thinking:
+an analyst's skill talks about dry-runs and sanity checks, a backend skill
+talks about EXPLAIN plans and smoke tests, an iOS skill talks about retain
+cycles and `prepareForReuse` — all inferred from behavior alone.
 
 ## When this helps / When it doesn't
 
