@@ -1,5 +1,6 @@
 node_modules/
 learning/data/
+demo-output/
 *.tmp
 .env
 .DS_Store

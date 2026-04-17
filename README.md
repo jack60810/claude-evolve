@@ -4,6 +4,24 @@ Claude Code watches what you do. This watches what Claude Code does, and makes i
 
 Most "memory" tools for AI assistants just store and retrieve. claude-evolve **evolves** — it spots your mistakes before you correct them, learns patterns you never explicitly teach, prunes rules that stop helping, and gets sharper every session. After enough sessions, it graduates from rules to full **Claude Code skills** that capture how you think.
 
+## See it in action (2 minutes to set up, 10 minutes to see)
+
+Don't want to read docs? Just pick a profession and watch the system learn:
+
+```bash
+git clone https://github.com/jack60810/claude-evolve.git
+cd claude-evolve
+node demo.js analyst          # or ios-engineer, game-developer, ml-ops, random...
+```
+
+The demo:
+1. Asks Claude (sonnet) to generate realistic deep work sessions for that profession
+2. Runs each session through the learning pipeline (just like a real user would)
+3. Observes patterns, scores rules, promotes mature ones to a skill
+4. Prints the final `CLAUDE.md` and `.claude/skills/auto-*.md` for you to read
+
+You'll see, in real output, the skill the system learned — the user's **thinking model**, not just their steps. Different profession = different skill. No hardcoded templates.
+
 ## The thing that matters most: anti-pattern detection
 
 Other tools wait for you to say "don't do that." claude-evolve watches the full session timeline — every Read, Edit, Bash, every MCP call — and spots suboptimal behaviors on its own.
@@ -72,25 +90,17 @@ No manual wiring needed. The full loop — observe → learn → promote → rou
 
 Cross-project transfer: when you start a new project of the same type (e.g., another analysis project), the system suggests patterns it learned from your other projects.
 
-### Validated with deep simulation
+### What the demo shows
 
-The integration test simulates 6 deep multi-turn sessions for any profession. Each session has 10-16 tool calls representing realistic investigation, mistakes, corrections, and validation. The system should extract rules and eventually form a skill that captures the user's thinking model — not just their steps.
-
-The profession profile is entirely LLM-generated. Pass any name:
-
-```bash
-node test/integration-deep-session.js analyst
-node test/integration-deep-session.js backend-engineer
-node test/integration-deep-session.js ios-engineer
-node test/integration-deep-session.js game-developer
-node test/integration-deep-session.js security-researcher
-node test/integration-deep-session.js random            # LLM picks one
-```
+The `demo.js` script is the easiest way to understand what claude-evolve actually does. It simulates 6 deep multi-turn sessions for any profession (10-16 tool calls each, with realistic investigation → mistakes → corrections → validation), then shows you the final `CLAUDE.md` and skill file the system produced.
 
 For each profession, the generated skill captures domain-specific thinking:
 an analyst's skill talks about dry-runs and sanity checks, a backend skill
 talks about EXPLAIN plans and smoke tests, an iOS skill talks about retain
 cycles and `prepareForReuse` — all inferred from behavior alone.
+
+The demo uses an isolated output directory (`demo-output/`) and cleans up
+after itself. It doesn't touch your real project learning.
 
 ## When this helps / When it doesn't
 
