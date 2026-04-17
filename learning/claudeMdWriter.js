@@ -170,8 +170,8 @@ function writeRulesToClaudeMd(projectPath, rules, skillRoutes) {
       const before = content.slice(0, sectionStart).trimEnd();
       const after = content.slice(endIdx + MANAGED_END.length).trimStart();
 
-      if (rules.length === 0) {
-        // Remove managed section entirely
+      if (!hasContent) {
+        // Remove managed section entirely (no rules AND no skill routes)
         newContent = before + (after ? '\n\n' + after : '') + '\n';
       } else {
         newContent = before + '\n' + managedSection + (after ? '\n\n' + after : '') + '\n';
