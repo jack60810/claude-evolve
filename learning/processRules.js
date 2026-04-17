@@ -33,8 +33,8 @@ function log(msg) {
 function fallbackTriage(newMemories, observations, activeRuleCount, sessionCount, highScoreGroups) {
   let gene = 'observe';
   if ((newMemories || []).length > 0) gene = 'repair';
-  else if ((observations || []).length >= 3 && activeRuleCount === 0) gene = 'repair';
-  else if ((observations || []).length >= 5) gene = 'innovate';
+  else if ((observations || []).length >= 3 && activeRuleCount === 0) gene = 'innovate'; // Fix 2: learn from session 1
+  else if ((observations || []).length >= 3) gene = 'innovate'; // Fix 2: lower threshold from 5 to 3
   else if ((highScoreGroups || 0) > 0) gene = 'skillify';
   else if (activeRuleCount >= 8) gene = 'cleanup';
   else if (sessionCount > 0 && sessionCount % 3 === 0) gene = 'optimize';
@@ -323,6 +323,40 @@ async function main() {
     }
   }
 
+  // --- Fix 4: Auto-dedup when rules pile up, regardless of which gene ran ---
+  if (gene !== 'cleanup') {
+    const postGeneActive = ruleEngine.getActiveRules(project);
+    if (postGeneActive.length >= 6) {
+      // Quick keyword-based dedup: if two rules share >50% keywords, demote the lower-scored one
+      const data = ruleEngine.loadPopulation();
+      let deduped = 0;
+      const seen = new Set();
+      for (let i = 0; i < postGeneActive.length; i++) {
+        if (seen.has(postGeneActive[i].id)) continue;
+        for (let j = i + 1; j < postGeneActive.length; j++) {
+          if (seen.has(postGeneActive[j].id)) continue;
+          const sim = ruleEngine.jaccardSimilarity(
+            postGeneActive[i].keywords || [], postGeneActive[j].keywords || []
+          );
+          if (sim > 0.5) {
+            // Demote the lower-scored duplicate
+            const loser = (postGeneActive[i].score || 0) >= (postGeneActive[j].score || 0)
+              ? postGeneActive[j] : postGeneActive[i];
+            const pop = data.population.find(x => x.id === loser.id);
+            if (pop && pop.status === 'active') {
+              pop.status = 'dormant';
+              pop.dormant_since_session = ruleEngine.loadPopulation().session_count || 0;
+              seen.add(loser.id);
+              deduped++;
+              log(`  Auto-dedup: demoted "${loser.content.slice(0, 40)}" (sim=${sim.toFixed(2)})`);
+            }
+          }
+        }
+      }
+      if (deduped > 0) ruleEngine.savePopulation(data);
+    }
+  }
+
   // gene === 'observe' → no LLM calls, just record
 
   // --- Validate (only if we changed something) ---
@@ -346,25 +380,43 @@ async function main() {
     }
   }
 
-  // --- P2: Lightweight scoring every session (not just during optimize) ---
-  // Quick evaluation: let LLM score all active rules against this session's observations.
-  // This ensures rules accumulate scores naturally without waiting for triage to pick optimize.
-  if (gene !== 'optimize' && observations && observations.length >= 3) {
+  // --- P2 fix: Heuristic scoring every session (no LLM call, no timeout risk) ---
+  // For each active rule, check if any observation's input/output contains rule keywords.
+  // If keywords appear in this session's observations → score up. If absent → neutral.
+  // This is fast (pure JS, no LLM) and ensures scores accumulate naturally.
+  if (observations && observations.length >= 3) {
     const scorableRules = ruleEngine.getActiveRules(project);
     if (scorableRules.length > 0) {
-      try {
-        log(`Quick-score: evaluating ${scorableRules.length} rules against session...`);
-        const evalResult = llmBrain.evaluateRuleSet(scorableRules, observations, newMemories);
-        if (evalResult && Array.isArray(evalResult.evaluations)) {
-          const changes = ruleEngine.applyScores(project, evalResult.evaluations);
-          const meaningful = changes.filter(c => Math.abs(c.new_score - c.old_score) > 0.3);
-          if (meaningful.length > 0) {
-            for (const c of meaningful) {
-              log(`  Quick-score ${c.rule_id.slice(0, 12)}: ${c.old_score} → ${c.new_score}`);
-            }
-          }
-        }
-      } catch (err) { log(`Quick-score error: ${err.message}`); }
+      const obsText = observations.map(o => `${o.input || ''} ${o.output || ''}`).join(' ').toLowerCase();
+      const data = ruleEngine.loadPopulation();
+      let scored = 0;
+
+      for (const rule of scorableRules) {
+        const pop = data.population.find(x => x.id === rule.id);
+        if (!pop) continue;
+
+        // Count how many of the rule's keywords appear in session observations
+        const kw = (rule.keywords || []);
+        const hits = kw.filter(k => obsText.includes(k.toLowerCase())).length;
+        const hitRatio = kw.length > 0 ? hits / kw.length : 0;
+
+        // Score: 8 if strong match (>60% keywords), 6 if partial (>30%), 5 if no match
+        let sessionScore = 5;
+        if (hitRatio > 0.6) sessionScore = 8;
+        else if (hitRatio > 0.3) sessionScore = 6;
+
+        // EMA: 30% new, 70% old
+        const alpha = 0.3;
+        const oldScore = pop.score || 5;
+        pop.score = parseFloat((oldScore * (1 - alpha) + sessionScore * alpha).toFixed(1));
+        pop.relevance_count = (pop.relevance_count || 0) + 1;
+        pop.sessions_evaluated = (pop.sessions_evaluated || 0) + 1;
+
+        if (Math.abs(pop.score - oldScore) > 0.2) scored++;
+      }
+
+      ruleEngine.savePopulation(data);
+      if (scored > 0) log(`Heuristic-score: ${scored} rules updated`);
     }
   }
 

@@ -459,7 +459,8 @@ describe('skillWriter', () => {
     const writeResult = skillWriter.writeSkill(tmpDir, rule);
     assert.ok(fs.existsSync(writeResult.path));
 
-    // Delete
+    // Delete using the path from writeResult (skill name may differ from slug)
+    rule.skill_path = writeResult.path;
     const deleteResult = skillWriter.deleteSkill(tmpDir, rule);
     assert.ok(deleteResult.deleted, 'Should report deleted=true');
     assert.ok(!fs.existsSync(deleteResult.path), 'File should be gone');

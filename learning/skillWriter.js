@@ -173,33 +173,46 @@ function buildSkillBody(primaryRule, relatedRules, slug, projectType) {
 function writeSkill(projectPath, primaryRule, relatedRules, projectType, memories, sessionNarratives) {
   const allRules = [primaryRule, ...(relatedRules || [])];
   const combinedKeywords = [...new Set(allRules.flatMap(r => r.keywords || []))];
-  const slug = generateSlug({ keywords: combinedKeywords, id: primaryRule.id });
-  const skillPath = path.join(projectPath, SKILLS_DIR, SKILL_PREFIX + slug + '.md');
-  const skillDir = path.dirname(skillPath);
+  const fallbackSlug = generateSlug({ keywords: combinedKeywords, id: primaryRule.id });
 
   // Ensure directory exists
+  const skillDir = path.join(projectPath, SKILLS_DIR);
   fs.mkdirSync(skillDir, { recursive: true });
-
-  // Check if file already exists and user has edited it
-  if (fs.existsSync(skillPath)) {
-    const existing = fs.readFileSync(skillPath, 'utf8');
-    const storedHash = extractStoredHash(existing);
-
-    if (storedHash) {
-      const existingBody = existing.split('\n').slice(1).join('\n');
-      const existingBodyHash = crypto.createHash('sha256').update(existingBody, 'utf8').digest('hex');
-
-      if (storedHash !== existingBodyHash) {
-        const msg = `[skillWriter] Skipping ${skillPath}: user-edited`;
-        if (typeof console !== 'undefined') console.warn(msg);
-        return { written: false, path: skillPath, reason: 'user-edited' };
-      }
-    }
-  }
 
   // Call Claude Code to generate the skill content (with memories for thinking-pattern inference)
   const llmBrain = require('./llmBrain');
-  const result = llmBrain.generateSkillContent(allRules, projectType, slug, memories, sessionNarratives);
+  const result = llmBrain.generateSkillContent(allRules, projectType, fallbackSlug, memories, sessionNarratives);
+
+  // Fix 5: Extract name from LLM-generated content for a better slug
+  let slug = fallbackSlug;
+  if (result && result.content) {
+    const nameMatch = result.content.match(/name:\s*"?auto-([^"\n]+)"?/);
+    if (nameMatch) slug = nameMatch[1].trim().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-');
+  }
+
+  const skillPath = path.join(skillDir, SKILL_PREFIX + slug + '.md');
+
+  // Check if file already exists and user has edited it
+  // Also check old slug path (in case LLM changed the name)
+  const oldPath = path.join(skillDir, SKILL_PREFIX + fallbackSlug + '.md');
+  for (const checkPath of [skillPath, oldPath]) {
+    if (fs.existsSync(checkPath)) {
+      const existing = fs.readFileSync(checkPath, 'utf8');
+      const storedHash = extractStoredHash(existing);
+      if (storedHash) {
+        const existingBody = existing.split('\n').slice(1).join('\n');
+        const existingBodyHash = crypto.createHash('sha256').update(existingBody, 'utf8').digest('hex');
+        if (storedHash !== existingBodyHash) {
+          return { written: false, path: checkPath, reason: 'user-edited' };
+        }
+      }
+      // Clean up old slug file if name changed
+      if (checkPath === oldPath && checkPath !== skillPath) {
+        try { fs.unlinkSync(oldPath); } catch {}
+      }
+      break;
+    }
+  }
 
   if (!result || !result.content) {
     // LLM failed — fall back to basic template

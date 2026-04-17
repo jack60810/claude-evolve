@@ -834,7 +834,7 @@ YOUR JOB: Infer the user's underlying THINKING MODEL from these rules, correctio
 Generate a Claude Code SKILL.md with:
 
 1. YAML frontmatter:
-   - name: "auto-${slug}"
+   - name: Choose a SHORT, READABLE name like "auto-bq-analysis-method" or "auto-data-validation-flow" (not a keyword dump). Max 5 words hyphenated. Must start with "auto-".
    - description: 2-3 lines explaining the THINKING APPROACH (not just "this skill does X")
    - triggers: 3-5 natural trigger phrases
 

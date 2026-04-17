@@ -282,6 +282,37 @@ async function main() {
     }
   }
 
+  // Fix 3: Validate generated skill files are loadable by Claude Code
+  log('\n=== SKILL VALIDATION ===');
+  if (fs.existsSync(skillDir)) {
+    const skills = fs.readdirSync(skillDir).filter(f => f.endsWith('.md'));
+    let valid = 0;
+    let invalid = 0;
+    for (const s of skills) {
+      const content = fs.readFileSync(path.join(skillDir, s), 'utf8');
+      const checks = {
+        hasHashMarker: content.includes('claude-evolve:auto-skill'),
+        hasFrontmatter: content.includes('---'),
+        hasName: /name:\s*"?auto-/.test(content),
+        hasDescription: /description:/.test(content),
+        hasTriggers: /triggers:/.test(content),
+        hasThinkingOrWorkflow: /## (Thinking Model|Workflow|Steps)/.test(content),
+        hasWhatNotToDo: /## What NOT to [Dd]o/.test(content),
+        under200Lines: content.split('\n').length < 200,
+        notEmpty: content.trim().length > 100,
+      };
+      const failed = Object.entries(checks).filter(([, v]) => !v);
+      if (failed.length === 0) {
+        valid++;
+        log(`  ✓ ${s} — all checks pass`);
+      } else {
+        invalid++;
+        log(`  ✗ ${s} — failed: ${failed.map(([k]) => k).join(', ')}`);
+      }
+    }
+    log(`Skill validation: ${valid} valid, ${invalid} invalid`);
+  }
+
   // Final summary
   log('\n=== SUMMARY ===');
   const finalStats = ruleEngine.getPopulationStats(TEST_PROJECT);
