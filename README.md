@@ -50,6 +50,26 @@ LIMIT 10 first, confirm logic, then expand. Never run the full query on first tr
 
 Skills live in `.claude/skills/auto-*.md`. They follow the standard Claude Code skill format with triggers, so Claude loads them automatically. Skills that stop being useful get demoted back to rules, and eventually pruned. The whole lifecycle is bidirectional.
 
+### Automatic skill routing
+
+When a skill is generated, the system also writes a **Skill Routing** block into the project's `CLAUDE.md`. This is how Claude Code knows when to load the skill:
+
+```markdown
+<!-- claude-evolve:managed-start -->
+<!-- claude-evolve:skill-routing -->
+### Skill Routing
+
+- **auto-bq-safe-analysis** (.claude/skills/auto-bq-safe-analysis.md):
+  Cost-aware, correctness-first BigQuery analytics thinking model
+  Triggers: run a BigQuery query, analyze experiment results, write a funnel query, ...
+
+When any of these triggers match, load and follow the corresponding skill before proceeding.
+<!-- /claude-evolve:skill-routing -->
+<!-- claude-evolve:managed-end -->
+```
+
+No manual wiring needed. The full loop — observe → learn → promote → route → Claude follows the skill — is automatic.
+
 Cross-project transfer: when you start a new project of the same type (e.g., another analysis project), the system suggests patterns it learned from your other projects.
 
 ### Validated with deep simulation
