@@ -2,7 +2,7 @@
 
 Claude Code watches what you do. This watches what Claude Code does, and makes it better at working with you.
 
-Most "memory" tools for AI assistants just store and retrieve. claude-evolve **evolves** — it spots your mistakes before you correct them, learns patterns you never explicitly teach, prunes rules that stop helping, and gets sharper every session.
+Most "memory" tools for AI assistants just store and retrieve. claude-evolve **evolves** — it spots your mistakes before you correct them, learns patterns you never explicitly teach, prunes rules that stop helping, and gets sharper every session. After enough sessions, it graduates from rules to full **Claude Code skills** that capture how you think.
 
 ## The thing that matters most: anti-pattern detection
 
@@ -20,6 +20,38 @@ These become corrective rules automatically. You don't have to say anything.
 
 This is the difference between a memory system and a learning system.
 
+## From rules to skills: the Continuum
+
+claude-evolve doesn't just write rules. It outputs at the right level of abstraction based on how mature a pattern is:
+
+```
+Session 1-5:    simple rules      →  "Always dry_run before BQ queries"
+Session 5-10:   compound rules    →  Multi-step checklist in CLAUDE.md
+Session 10+:    methodology       →  Full .claude/skills/ file
+```
+
+When enough related rules accumulate high scores, the system promotes them into a Claude Code skill file. The skill isn't a copy of the rules — Claude (sonnet) synthesizes them with your memories (corrections, preferences, project context) to produce a **thinking model**:
+
+```markdown
+## Thinking Model
+
+This user's thinking order is: cheap → correct → complete.
+
+Cost is the first gate, not an afterthought.
+Don't wait to be told — if scan exceeds 5GB, proactively suggest narrowing.
+
+Iteration is the default, not the backup.
+LIMIT 10 first, confirm logic, then expand. Never run the full query on first try.
+
+## What NOT to do
+- Don't run full queries without dry_run
+- Don't give absolute numbers without a comparison baseline
+```
+
+Skills live in `.claude/skills/auto-*.md`. They follow the standard Claude Code skill format with triggers, so Claude loads them automatically. Skills that stop being useful get demoted back to rules, and eventually pruned. The whole lifecycle is bidirectional.
+
+Cross-project transfer: when you start a new project of the same type (e.g., another analysis project), the system suggests patterns it learned from your other projects.
+
 ## When this helps / When it doesn't
 
 **This is for you if:**
@@ -34,7 +66,7 @@ This is the difference between a memory system and a learning system.
 - You don't want any background LLM calls (each session end makes 2-3 haiku/sonnet calls)
 - You want a vector database for semantic search (use [claude-mem](https://github.com/thedotmack/claude-mem) instead)
 
-The system needs ~5 sessions before it starts producing useful rules. ~20 sessions to get meaningfully better. If you're not going to give it that runway, it's overhead.
+The system needs ~5 sessions before it starts producing useful rules. ~10 sessions before skills start emerging. If you're not going to give it that runway, it's overhead.
 
 ## Origin story
 
@@ -67,11 +99,16 @@ Session ends → background pipeline:
     innovate: detect patterns + anti-patterns from observations
     optimize: LLM scores all active rules 0-10, demotes low scorers
     cleanup:  merge / rewrite / remove redundant rules
+    skillify: promote mature rule groups → .claude/skills/ files
     observe:  quiet session, just record
         ↓
   Validate: check for conflicts with hand-written rules
         ↓
-  Solidify: write to CLAUDE.md + compress session to memory
+  Classify complexity: simple / compound / workflow / methodology
+        ↓
+  Solidify: route output by complexity level
+    simple/compound/workflow → CLAUDE.md
+    methodology → .claude/skills/auto-*.md (via Claude sonnet)
         ↓
 Next session: Claude follows learned rules + has session history
 ```
@@ -98,6 +135,12 @@ Rules live in three states: **active** (in CLAUDE.md), **dormant** (demoted but 
 
 ### Session memory
 Every session is compressed into a structured `.md` file with summary, key decisions, and full observation timeline. A compact index is injected at session start.
+
+### Skill generation
+When 3+ related rules accumulate high scores over multiple sessions, the system promotes them to a `.claude/skills/` file. Claude (sonnet) generates the skill content, incorporating your feedback memories to produce a "thinking model" — not just steps, but how you approach a class of problems. Skills are scored and can be demoted back to rules if they stop being useful.
+
+### Cross-project learning
+Mature patterns are saved to a shared store keyed by project type (analysis, backend, infra). When you start a new project of the same type, the system suggests patterns from your other projects. Transfer is opt-in — you confirm before applying.
 
 ### Conflict detection
 New auto-learned rules are checked against your hand-written `CLAUDE.md`. Conflicts become alerts — your rules are never overwritten.
@@ -219,7 +262,8 @@ These are yours. claude-evolve will never modify them.
 | **Triage** | haiku | Determines gene + complexity from session data |
 | **Gene execute** | haiku or sonnet | Runs the selected gene's action |
 | **Validate** | keyword | Checks for conflicts with hand-written rules |
-| **Solidify** | — | Writes active rules to CLAUDE.md |
+| **Classify** | — | Determines output complexity level |
+| **Solidify** | — | Routes to CLAUDE.md or .claude/skills/ |
 | **Memory** | sonnet | Compresses session into persistent memory |
 
 ### Genes
@@ -230,6 +274,7 @@ These are yours. claude-evolve will never modify them.
 | `innovate` | Significant observations, no corrections | Detect patterns + anti-patterns from timeline |
 | `optimize` | Periodic (every ~3 sessions) | LLM scores all rules 0-10, demotes low scorers |
 | `cleanup` | 8+ active rules | LLM merges, rewrites, or removes redundant rules |
+| `skillify` | 3+ related high-score rules | Promote rule group to .claude/skills/ file |
 | `observe` | Trivial session | Just record, no action |
 
 ## How scoring works
@@ -255,17 +300,19 @@ These are yours. claude-evolve will never modify them.
 ```
 learning/
 ├── hooks/
-│   ├── session-start.js   — Inject session index + conflict alerts
-│   ├── session-end.js     — Collect observations + spawn background
+│   ├── session-start.js   — Inject index + conflict alerts + skill hints + cross-project suggestions
+│   ├── session-end.js     — Collect observations + classify project type + spawn background
 │   └── post-tool.js       — Record full tool input/output
-├── processRules.js        — Signal → Gene → Execute → Validate → Solidify
-├── llmBrain.js            — All LLM calls (triage, extraction, scoring, cleanup)
-├── ruleEngine.js          — Population lifecycle (active/dormant/dead)
-├── claudeMdWriter.js      — CLAUDE.md managed section read/write
-├── memoryReader.js        — Read Claude Code feedback memories
+├── processRules.js        — Signal → Gene → Execute → Classify → Route → Solidify
+├── llmBrain.js            — All LLM calls (triage, extraction, scoring, complexity, skill generation)
+├── ruleEngine.js          — Population lifecycle (active/dormant/dead) + complexity tracking
+├── claudeMdWriter.js      — CLAUDE.md managed section (simple/compound/workflow formats)
+├── skillWriter.js         — .claude/skills/ auto-generation via Claude sonnet
+├── memoryReader.js        — Read Claude Code memories (feedback/user/project/reference)
 ├── sessionMemory.js       — Three-tier session memory (index/summary/full)
 ├── exploration.js         — Manual: stale rule and drift detection
-├── analyzer.js            — Session statistics aggregation
+├── analyzer.js            — Session statistics + project type classification
+├── genes.json             — Gene definitions (repair/innovate/optimize/cleanup/skillify/observe)
 └── setup.js               — One-command install/check/uninstall
 ```
 
