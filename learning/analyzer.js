@@ -181,4 +181,38 @@ function detectProject(cwd) {
   return parts.slice(0, 2).join('/') || parts[0] || 'unknown';
 }
 
-module.exports = { analyzeSession, updateProfile, generateContext, readProfile, createEmptyProfile, detectProject };
+// ===================== Project-type classification =====================
+
+/**
+ * Classify project type based on accumulated tool and behavior patterns.
+ * Returns a type string: 'analysis', 'frontend', 'backend', 'fullstack', 'infra', 'documentation', 'general'
+ */
+function classifyProjectType(sessionBehavior) {
+  if (!sessionBehavior) return 'general';
+
+  const { toolCounts = {}, dbTables = [], mcpTools = [], dbDryRuns = 0 } = sessionBehavior;
+
+  // Analysis: heavy BQ/database usage
+  const hasDbTables = dbTables.length > 0;
+  const hasAmplitude = mcpTools.some(t => t.includes('Amplitude') || t.includes('amplitude'));
+  if (hasDbTables || hasAmplitude || dbDryRuns > 0) return 'analysis';
+
+  // Frontend: lots of component files, CSS, React patterns
+  const readCount = toolCounts['Read'] || 0;
+  const editCount = toolCounts['Edit'] || 0;
+  const writeCount = toolCounts['Write'] || 0;
+  const bashCount = toolCounts['Bash'] || 0;
+
+  // Documentation: mostly Read + Write, few Bash
+  if (readCount > 5 && writeCount > 3 && bashCount < 3 && editCount < 3) return 'documentation';
+
+  // Infra: lots of Bash, few Edit
+  if (bashCount > 10 && editCount < 3) return 'infra';
+
+  // Backend/general: mixed tool usage
+  if (editCount > 5 && bashCount > 5) return 'backend';
+
+  return 'general';
+}
+
+module.exports = { analyzeSession, updateProfile, generateContext, readProfile, createEmptyProfile, detectProject, classifyProjectType };

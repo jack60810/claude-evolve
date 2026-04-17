@@ -31,6 +31,12 @@
       "trigger": "quiet",
       "description": "Trivial session. Record but take no action.",
       "signals": []
+    },
+    {
+      "id": "gene_skillify",
+      "trigger": "mature_patterns",
+      "description": "Accumulated patterns form a methodology. Classify complexity and promote to higher output format.",
+      "signals": ["cross_session_consistency", "methodology_detected", "high_complexity_patterns"]
     }
   ]
 }

@@ -371,9 +371,10 @@ No patterns? Reply: {"patterns": []}`;
  * @param {Array} newMemories - Correction memories
  * @param {number} activeRuleCount - Current active rules
  * @param {number} sessionCount - Total sessions so far
+ * @param {number} highScoreRelatedGroups - Number of groups of 3+ related high-score rules
  * @returns {{ gene: string, complexity: 'routine'|'complex', reason: string }}
  */
-function triage(observations, newMemories, activeRuleCount, sessionCount) {
+function triage(observations, newMemories, activeRuleCount, sessionCount, highScoreRelatedGroups) {
   const corrCount = (newMemories || []).length;
   const obsCount = (observations || []).length;
 
@@ -392,20 +393,22 @@ SESSION:
 - Corrections: ${corrCount}${corrCount > 0 ? ' (' + corrNames.slice(0, 200) + ')' : ''}
 - Active rules: ${activeRuleCount}
 - Session number: ${sessionCount}
+- High-score rule groups: ${highScoreRelatedGroups || 0}
 
-Pick ONE gene:
-- "repair": corrections exist → extract rules from what the user corrected
-- "innovate": no corrections but significant work (5+ tool calls) → find patterns and anti-patterns from behavior
-- "optimize": no corrections, periodic check → evaluate existing rules, score and demote bad ones
-- "cleanup": 8+ active rules → merge, simplify, remove redundant rules
-- "observe": trivial session (< 3 tool calls) → just record, do nothing
+Pick ONE gene (check in this priority order):
+1. "repair": corrections exist → extract rules from what the user corrected
+2. "skillify": High-score rule groups > 0 → ALWAYS prefer this when mature rule groups exist. These rules have proven themselves over many sessions and should be promoted to a higher output format (workflow block or skill file). This is high-value work even if the session itself was quiet.
+3. "innovate": no corrections but significant work (5+ tool calls) → find patterns and anti-patterns from behavior
+4. "optimize": periodic check (every ~3 sessions) → evaluate existing rules, score and demote bad ones
+5. "cleanup": 8+ active rules → merge, simplify, remove redundant rules
+6. "observe": trivial session (< 3 tool calls) AND no high-score groups → just record, do nothing
 
 Pick complexity:
 - "routine": simple correction, minor observation, standard cleanup
 - "complex": fundamental methodology change, new workflow pattern, conflicting corrections, major rule restructuring
 
 Reply JSON only:
-{"gene": "repair|innovate|optimize|cleanup|observe", "complexity": "routine|complex", "reason": "<one sentence>"}`;
+{"gene": "repair|innovate|optimize|cleanup|skillify|observe", "complexity": "routine|complex", "reason": "<one sentence>"}`;
 
   return askClaudeWithRetry(prompt, 20000, 'fast');
 }
@@ -662,6 +665,67 @@ Reply JSON only:
 }
 
 /**
+ * Classify the complexity level of a rule for output routing.
+ * Determines whether a rule belongs in CLAUDE.md or a skill file.
+ *
+ * @param {{ content: string, keywords: string[], score: number }} rule - The rule to classify
+ * @param {Array} existingRules - Currently active rules (for related-rule detection)
+ * @param {string} projectType - Project type string (e.g., 'node', 'python')
+ * @returns {'simple'|'compound'|'workflow'|'methodology'}
+ */
+function classifyComplexity(rule, existingRules, projectType) {
+  // Count related existing rules (jaccard > 0.3 on keywords, score > 7)
+  const ruleEngine = require('./ruleEngine');
+  const relatedHighScore = (existingRules || []).filter(r =>
+    r.id !== rule.id &&
+    (r.score || 0) > 7 &&
+    ruleEngine.jaccardSimilarity(r.keywords || [], rule.keywords || []) > 0.3
+  );
+
+  const relatedHint = relatedHighScore.length >= 3
+    ? `\nNOTE: There are ${relatedHighScore.length} related existing rules (keyword overlap > 0.3, all score > 7). This is evidence for workflow or methodology level.`
+    : '';
+
+  const existingDesc = (existingRules || []).slice(0, 15).map(r =>
+    `[${r.id}] (score=${r.score || 5}) ${r.content.slice(0, 100)}`
+  ).join('\n');
+
+  const prompt = `Classify the complexity level of this auto-learned rule.
+
+RULE:
+${rule.content}
+
+Keywords: ${(rule.keywords || []).join(', ')}
+Score: ${rule.score || 5}
+Project type: ${projectType || 'unknown'}
+
+EXISTING ACTIVE RULES:
+${existingDesc || '(none)'}
+${relatedHint}
+
+Complexity levels (choose the HIGHEST level that fits):
+- "simple": single actionable instruction (e.g., "Always Read before Edit")
+- "compound": 2-3 related sub-instructions that belong together (e.g., "When doing BQ analysis: dry_run first, filter by partition, confirm time range")
+- "workflow": ordered multi-step process with clear sequence (e.g., "1. Define base 2. Check sources 3. Write query 4. Validate")
+- "methodology": 3+ related rules that together form a coherent practice for a specific domain. If the input contains multiple rules about the SAME topic (e.g., all about BQ analysis, all about testing, all about deployment), classify as methodology. A methodology doesn't need to span multiple workflows — it needs to capture HOW someone approaches a class of problems.
+
+IMPORTANT: When classifying a GROUP of related rules (not a single rule), lean toward "workflow" or "methodology". Groups of 3+ related high-score rules are strong evidence of an emerging methodology.
+
+Reply JSON only:
+{"complexity": "simple|compound|workflow|methodology", "reason": "<one sentence>"}`;
+
+  const result = askClaudeWithRetry(prompt, 20000, 'fast');
+
+  if (result && result.complexity &&
+      ['simple', 'compound', 'workflow', 'methodology'].includes(result.complexity)) {
+    return result.complexity;
+  }
+
+  // Safe fallback on LLM failure
+  return 'simple';
+}
+
+/**
  * Cleanup: merge, rewrite, or remove rules.
  * Called when there are too many active rules.
  *
@@ -699,6 +763,135 @@ No changes needed? Reply: {"actions": []}`;
   return askClaudeWithRetry(prompt, 25000, 'smart');
 }
 
+/**
+ * Generate a complete Claude Code skill file from a group of related methodology rules.
+ * Uses Claude's native understanding of the skill format to produce high-quality output.
+ * Incorporates user memories (corrections, preferences, project context) to infer
+ * the user's THINKING PATTERNS, not just the steps they follow.
+ *
+ * @param {Array} rules - Group of related rules forming a methodology
+ * @param {string} projectType - Project type (e.g., 'analysis', 'backend')
+ * @param {string} slug - Skill slug for the name field
+ * @param {Array} [memories] - User/feedback/project memories for thinking pattern inference
+ * @param {Array} [sessionNarratives] - Recent session summaries for context
+ * @returns {{ content: string } | null} The full skill file content, or null on failure
+ */
+function generateSkillContent(rules, projectType, slug, memories, sessionNarratives) {
+  if (!rules || rules.length === 0) return null;
+
+  const rulesDesc = rules.map((r, i) =>
+    `${i + 1}. ${r.content}`
+  ).join('\n');
+
+  const keywords = [...new Set(rules.flatMap(r => r.keywords || []))];
+  const sessionsObserved = Math.max(...rules.map(r => r.sessions_evaluated || 0));
+
+  // Build memory context for thinking pattern inference
+  let memoryContext = '';
+  if (memories && memories.length > 0) {
+    const feedbacks = memories.filter(m => m.type === 'feedback').slice(-10);
+    const userPrefs = memories.filter(m => m.type === 'user').slice(-5);
+    const projectCtx = memories.filter(m => m.type === 'project').slice(-5);
+
+    if (feedbacks.length > 0) {
+      memoryContext += '\nUSER CORRECTIONS (things the user explicitly told Claude to do differently):\n';
+      memoryContext += feedbacks.map(m => `- ${m.name}: ${m.content.slice(0, 200)}`).join('\n');
+    }
+    if (userPrefs.length > 0) {
+      memoryContext += '\nUSER PREFERENCES (how this user likes to work):\n';
+      memoryContext += userPrefs.map(m => `- ${m.name}: ${m.content.slice(0, 200)}`).join('\n');
+    }
+    if (projectCtx.length > 0) {
+      memoryContext += '\nPROJECT CONTEXT (domain knowledge):\n';
+      memoryContext += projectCtx.map(m => `- ${m.name}: ${m.content.slice(0, 200)}`).join('\n');
+    }
+  }
+
+  let narrativeContext = '';
+  if (sessionNarratives && sessionNarratives.length > 0) {
+    narrativeContext = '\nRECENT SESSION STORIES (what happened in past sessions):\n';
+    narrativeContext += sessionNarratives.slice(-5).map(n =>
+      `- ${n.timestamp ? n.timestamp.slice(0, 10) : '?'}: ${(n.summary || n.narrative || '').slice(0, 200)}`
+    ).join('\n');
+  }
+
+  const prompt = `You are generating a Claude Code skill file that captures a user's THINKING PATTERNS, not just steps.
+
+This user has worked on a "${projectType}" project for ${sessionsObserved} sessions. From observing their behavior, these ${rules.length} rules emerged:
+
+OBSERVED RULES (what the user consistently does):
+${rulesDesc}
+${memoryContext}
+${narrativeContext}
+
+YOUR JOB: Infer the user's underlying THINKING MODEL from these rules, corrections, and preferences. Don't just list the rules as steps. Figure out:
+- WHY they do things in this order (what's the mental model?)
+- What they care about MOST (cost? correctness? speed? safety?)
+- What they do PROACTIVELY without being asked
+- What mistakes they've corrected Claude on (these reveal values)
+- Hidden assumptions they make that Claude should also make
+
+Generate a Claude Code SKILL.md with:
+
+1. YAML frontmatter:
+   - name: "auto-${slug}"
+   - description: 2-3 lines explaining the THINKING APPROACH (not just "this skill does X")
+   - triggers: 3-5 natural trigger phrases
+
+2. A "## Thinking Model" section:
+   Instead of numbered steps, describe the user's DECISION-MAKING PATTERNS.
+   Write as instructions to Claude: "When the user asks you to do X, here's how they think about it..."
+   Use patterns like:
+   - "This user prioritizes X over Y. Always check X first."
+   - "Don't wait to be asked — proactively do Z because this user always wants it."
+   - "When results look off, this user expects you to catch it yourself."
+
+3. A "## Workflow" section:
+   The concrete steps, but written as a natural workflow with decision points, not a rigid checklist.
+   Include conditional branches: "If X, then do Y. Otherwise, Z."
+
+4. A "## What NOT to do" section:
+   Anti-patterns inferred from corrections and observations. Things Claude should avoid.
+
+FORMAT RULES:
+- Start with --- for YAML frontmatter
+- Write in the same language as the rules
+- Keep under 100 lines
+- Sound like a mentor briefing a colleague, not a manual
+- Be specific: use real table names, tool names, thresholds from the rules
+
+Output ONLY the raw file content starting with ---. No explanation.`;
+
+  const result = askClaudeWithRetry(prompt, 45000, 'smart');
+
+  if (!result) return null;
+
+  // The LLM should return raw content, but might wrap in { raw: "..." }
+  let content = '';
+  if (typeof result === 'string') {
+    content = result;
+  } else if (result.raw) {
+    content = result.raw;
+  } else {
+    // Try to extract from JSON if LLM wrapped it
+    content = JSON.stringify(result);
+  }
+
+  // Validate: must start with --- (YAML frontmatter)
+  content = content.trim();
+  if (!content.startsWith('---')) {
+    // Try to find the --- in the content (LLM might have added explanation before)
+    const idx = content.indexOf('---');
+    if (idx !== -1) {
+      content = content.slice(idx);
+    } else {
+      return null; // Can't salvage
+    }
+  }
+
+  return { content };
+}
+
 module.exports = {
   askClaude,
   extractRule,
@@ -716,4 +909,7 @@ module.exports = {
   triage,
   evaluateRuleSet,
   cleanupRules,
+  // Continuum writer
+  classifyComplexity,
+  generateSkillContent,
 };

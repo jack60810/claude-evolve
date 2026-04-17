@@ -4,11 +4,12 @@
 // Signal → Gene → LLM Execute → Validate → Solidify
 //
 // Signal: What happened in this session? (corrections, observations, quiet)
-// Gene: What action to take? (repair / innovate / optimize / cleanup)
+// Gene: What action to take? (repair / innovate / optimize / cleanup / skillify)
 //   - repair:   corrections detected → extract new rules from feedback
 //   - innovate: patterns/anti-patterns detected → extract rules from observations
 //   - optimize: LLM evaluates all active rules, scores them, demotes bad ones
 //   - cleanup:  too many rules → LLM merges and simplifies
+//   - skillify: 3+ related high-score rules → re-classify complexity, promote to skill files
 // Execute: LLM performs the gene's action
 // Validate: LLM checks the resulting rule set for conflicts and consistency
 // Solidify: Write to CLAUDE.md + session memory
@@ -29,11 +30,12 @@ function log(msg) {
 // TRIAGE FALLBACK (if LLM triage fails, use simple heuristics)
 // =====================================================================
 
-function fallbackTriage(newMemories, observations, activeRuleCount, sessionCount) {
+function fallbackTriage(newMemories, observations, activeRuleCount, sessionCount, highScoreGroups) {
   let gene = 'observe';
   if ((newMemories || []).length > 0) gene = 'repair';
   else if ((observations || []).length >= 3 && activeRuleCount === 0) gene = 'repair';
   else if ((observations || []).length >= 5) gene = 'innovate';
+  else if ((highScoreGroups || 0) > 0) gene = 'skillify';
   else if (activeRuleCount >= 8) gene = 'cleanup';
   else if (sessionCount > 0 && sessionCount % 3 === 0) gene = 'optimize';
   return { gene, complexity: 'routine', reason: 'fallback heuristic' };
@@ -68,22 +70,38 @@ async function main() {
   const stats = ruleEngine.getPopulationStats(project);
   log(`Session #${sessionCount} | active=${stats.active} dormant=${stats.dormant} dead=${stats.dead}`);
 
+  // --- Count groups of 3+ related rules with score > 7 (for skillify) ---
+  let highScoreGroups = 0;
+  {
+    const checked = new Set();
+    for (const rule of activeRules) {
+      if (checked.has(rule.id) || (rule.score || 0) <= 7) continue;
+      const related = ruleEngine.getRelatedRules(project, rule, 0.2)
+        .filter(r => (r.score || 0) > 7);
+      if (related.length >= 2) {
+        highScoreGroups++;
+        checked.add(rule.id);
+        for (const r of related) checked.add(r.id);
+      }
+    }
+  }
+
   // --- Triage: LLM decides gene + complexity ---
   let gene = 'observe';
   let complexity = 'routine';
   try {
-    const triageResult = llmBrain.triage(observations, newMemories, stats.active, sessionCount);
+    const triageResult = llmBrain.triage(observations, newMemories, stats.active, sessionCount, highScoreGroups);
     if (triageResult && triageResult.gene) {
       gene = triageResult.gene;
       complexity = triageResult.complexity || 'routine';
       log(`Triage (LLM): gene=${gene} complexity=${complexity} — ${triageResult.reason || ''}`);
     } else {
-      const fb = fallbackTriage(newMemories, observations, stats.active, sessionCount);
+      const fb = fallbackTriage(newMemories, observations, stats.active, sessionCount, highScoreGroups);
       gene = fb.gene; complexity = fb.complexity;
       log(`Triage (fallback): gene=${gene}`);
     }
   } catch (err) {
-    const fb = fallbackTriage(newMemories, observations, stats.active, sessionCount);
+    const fb = fallbackTriage(newMemories, observations, stats.active, sessionCount, highScoreGroups);
     gene = fb.gene; complexity = fb.complexity;
     log(`Triage error, using fallback: gene=${gene} — ${err.message || err}`);
   }
@@ -94,6 +112,7 @@ async function main() {
 
   let rulesAdded = 0;
   let conflictsFound = 0;
+  const sessionRuleIds = new Set(); // Track rule IDs born/modified this session
 
   // --- Execute gene ---
   if (gene === 'repair') {
@@ -119,7 +138,8 @@ async function main() {
           continue;
         }
 
-        ruleEngine.addRule(project, ruleContent, 'correction', keywords, 'active');
+        const added = ruleEngine.addRule(project, ruleContent, 'correction', keywords, 'active');
+        sessionRuleIds.add(added.id);
         rulesAdded++;
         log(`  Added [correction]: "${ruleContent.slice(0, 60)}"`);
       } catch (err) { log(`  Error: ${err.message}`); }
@@ -134,7 +154,8 @@ async function main() {
             if (!p.rule || p.confidence === 'low') continue;
             if (ruleEngine.isDuplicate(project, p.keywords || [])) continue;
             const src = (obsResult.anti_patterns || []).includes(p) ? 'anti_pattern' : 'observation';
-            ruleEngine.addRule(project, p.rule, src, p.keywords, 'active');
+            const added = ruleEngine.addRule(project, p.rule, src, p.keywords, 'active');
+            sessionRuleIds.add(added.id);
             rulesAdded++;
             log(`  Added [${src}]: "${p.rule.slice(0, 60)}"`);
           }
@@ -154,7 +175,8 @@ async function main() {
             if (!p.rule || p.confidence === 'low') continue;
             if (ruleEngine.isDuplicate(project, p.keywords || [])) continue;
             const status = stats.active < ruleEngine.MAX_ACTIVE ? 'active' : 'candidate';
-            ruleEngine.addRule(project, p.rule, 'observation', p.keywords, status);
+            const added = ruleEngine.addRule(project, p.rule, 'observation', p.keywords, status);
+            sessionRuleIds.add(added.id);
             rulesAdded++;
             log(`  Added [observation] as ${status}: "${p.rule.slice(0, 60)}"`);
           }
@@ -162,7 +184,8 @@ async function main() {
             if (!p.rule || p.confidence === 'low') continue;
             if (ruleEngine.isDuplicate(project, p.keywords || [])) continue;
             const status = stats.active < ruleEngine.MAX_ACTIVE ? 'active' : 'candidate';
-            ruleEngine.addRule(project, p.rule, 'anti_pattern', p.keywords, status);
+            const added = ruleEngine.addRule(project, p.rule, 'anti_pattern', p.keywords, status);
+            sessionRuleIds.add(added.id);
             rulesAdded++;
             log(`  Added [anti_pattern] as ${status}: "${p.rule.slice(0, 60)}"`);
           }
@@ -183,6 +206,37 @@ async function main() {
           const changes = ruleEngine.applyScores(project, evalResult.evaluations);
           for (const c of changes) {
             log(`  ${c.rule_id.slice(0, 12)}: ${c.old_score} → ${c.new_score} (LLM: ${c.llm_score}) ${c.reason}`);
+          }
+
+          // Re-evaluate complexity for rules whose score just crossed the >7 threshold
+          for (const change of changes) {
+            if (change.new_score > 7 && change.old_score <= 7) {
+              const rule = currentActive.find(r => r.id === change.rule_id);
+              if (rule && (rule.relevance_count || 0) >= 5) {
+                const related = ruleEngine.getRelatedRules(project, rule, 0.2)
+                  .filter(r => (r.score || 0) > 7);
+                if (related.length >= 2) {
+                  try {
+                    const group = [rule, ...related];
+                    const newComplexity = llmBrain.classifyComplexity(
+                      { content: group.map(r => r.content).join('\n'), keywords: [...new Set(group.flatMap(r => r.keywords || []))] },
+                      currentActive,
+                      pending.projectType || ''
+                    );
+                    const levels = ['simple', 'compound', 'workflow', 'methodology'];
+                    const currentLevel = levels.indexOf(rule.complexity || 'simple');
+                    const newLevel = levels.indexOf(newComplexity);
+                    if (newLevel > currentLevel) {
+                      ruleEngine.updateComplexity(project, rule.id, newComplexity);
+                      sessionRuleIds.add(rule.id);
+                      log(`  Optimize-promote ${rule.id.slice(0,12)}: ${rule.complexity || 'simple'} → ${newComplexity}`);
+                    }
+                  } catch (err) {
+                    log(`  Optimize-promote error: ${err.message}`);
+                  }
+                }
+              }
+            }
           }
         }
 
@@ -228,7 +282,8 @@ async function main() {
                 if (r) r.status = 'dormant';
               }
               ruleEngine.savePopulation(data);
-              ruleEngine.addRule(project, action.merged_rule, 'cleanup', action.keywords, 'active');
+              const added = ruleEngine.addRule(project, action.merged_rule, 'cleanup', action.keywords, 'active');
+              sessionRuleIds.add(added.id);
               log(`  Merged ${action.source_ids.length} → "${action.merged_rule.slice(0, 60)}"`);
             }
             if (action.type === 'rewrite' && action.rule_id && action.new_content) {
@@ -236,6 +291,7 @@ async function main() {
               if (r) {
                 r.content = action.new_content;
                 r.keywords = ruleEngine.extractKeywords(action.new_content);
+                sessionRuleIds.add(r.id); // Rewritten counts as modified
                 log(`  Rewritten: "${action.new_content.slice(0, 60)}"`);
               }
             }
@@ -250,10 +306,51 @@ async function main() {
     }
   }
 
+  if (gene === 'skillify') {
+    // Re-evaluate complexity for groups of related high-score rules
+    const currentActive = ruleEngine.getActiveRules(project);
+    const data = ruleEngine.loadPopulation();
+    const processed = new Set();
+
+    for (const rule of currentActive) {
+      if (processed.has(rule.id) || (rule.score || 0) <= 7) continue;
+      if ((rule.relevance_count || 0) < 5) continue;
+
+      const related = ruleEngine.getRelatedRules(project, rule, 0.2)
+        .filter(r => (r.score || 0) > 7 && (r.relevance_count || 0) >= 5);
+
+      if (related.length < 2) continue; // need 3+ rules total
+
+      const group = [rule, ...related];
+      log(`  Skillify: found group of ${group.length} related high-score rules`);
+
+      // Deterministic promotion: 3+ related high-score rules = methodology
+      // No LLM call needed here — the group criteria IS the signal.
+      const newComplexity = group.length >= 5 ? 'methodology' :
+                            group.length >= 3 ? 'methodology' : 'workflow';
+
+      const levels = ['simple', 'compound', 'workflow', 'methodology'];
+      for (const r of group) {
+        const currentLevel = levels.indexOf(r.complexity || 'simple');
+        const newLevel = levels.indexOf(newComplexity);
+        if (newLevel > currentLevel) {
+          const popRule = data.population.find(x => x.id === r.id);
+          if (popRule) {
+            popRule.complexity = newComplexity;
+            sessionRuleIds.add(r.id);
+            log(`  Promoted ${r.id.slice(0,12)}: ${r.complexity || 'simple'} → ${newComplexity}`);
+          }
+        }
+        processed.add(r.id);
+      }
+    }
+    ruleEngine.savePopulation(data);
+  }
+
   // gene === 'observe' → no LLM calls, just record
 
   // --- Validate (only if we changed something) ---
-  if (rulesAdded > 0 || gene === 'optimize' || gene === 'cleanup') {
+  if (rulesAdded > 0 || gene === 'optimize' || gene === 'cleanup' || gene === 'skillify') {
     // Quick validation: check the final active set isn't self-contradictory
     const finalActive = ruleEngine.getActiveRules(project);
     if (finalActive.length > 0 && handWrittenContent) {
@@ -273,10 +370,165 @@ async function main() {
     }
   }
 
-  // --- Solidify: write CLAUDE.md ---
+  // --- Solidify: classify complexity + route output ---
   const finalActive = ruleEngine.getActiveRules(project);
-  const writtenPath = claudeMdWriter.writeRulesToClaudeMd(project, finalActive);
-  log(`Solidified: ${finalActive.length} rules → ${writtenPath || 'CLAUDE.md'}`);
+
+  // Classify complexity for rules born/modified this session only
+  if (sessionRuleIds.size > 0) {
+    const data = ruleEngine.loadPopulation();
+    let classified = 0;
+    for (const rule of data.population) {
+      if (!sessionRuleIds.has(rule.id)) continue;
+      // Skip rules that already have a complexity field
+      if (rule.complexity) continue;
+      try {
+        rule.complexity = llmBrain.classifyComplexity(rule, finalActive, pending.projectType || '');
+        classified++;
+        log(`  Classified ${rule.id.slice(0, 12)}: ${rule.complexity}`);
+      } catch (err) {
+        rule.complexity = 'simple'; // safe fallback
+        log(`  Classify error for ${rule.id.slice(0, 12)}: ${err.message}, defaulting to simple`);
+      }
+    }
+    if (classified > 0) ruleEngine.savePopulation(data);
+  }
+
+  // Partition rules: methodology → skillWriter, others → claudeMdWriter
+  let skillWriter;
+  try { skillWriter = require('./skillWriter'); } catch { skillWriter = null; }
+
+  const methodologyRules = finalActive.filter(r => r.complexity === 'methodology');
+  const otherRules = finalActive.filter(r => r.complexity !== 'methodology');
+
+  if (skillWriter && methodologyRules.length > 0) {
+    try {
+      // Load user memories and session narratives for thinking-pattern inference
+      let allMemories = [];
+      let sessionNarratives = [];
+      try {
+        const memoryReader = require('./memoryReader');
+        allMemories = memoryReader.getAllMemories(project);
+      } catch {}
+      try {
+        const narrativePath = path.join(DATA_DIR, 'narrative.jsonl');
+        if (fs.existsSync(narrativePath)) {
+          sessionNarratives = fs.readFileSync(narrativePath, 'utf8').trim().split('\n')
+            .filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+        }
+      } catch {}
+
+      // Group methodology rules by keyword similarity, write ONE skill per group
+      const grouped = new Set();
+      for (const rule of methodologyRules) {
+        if (grouped.has(rule.id)) continue;
+        const related = methodologyRules.filter(r =>
+          r.id !== rule.id && !grouped.has(r.id) &&
+          ruleEngine.jaccardSimilarity(r.keywords || [], rule.keywords || []) > 0.2
+        );
+        const result = skillWriter.writeSkill(project, rule, related, pending.projectType || '', allMemories, sessionNarratives);
+        if (result && result.written) log(`  Skill file: ${result.path}`);
+        else if (result) log(`  Skill skipped: ${result.reason || 'unknown'}`);
+        grouped.add(rule.id);
+        for (const r of related) grouped.add(r.id);
+      }
+      log(`Solidified: ${methodologyRules.length} methodology rules → ${grouped.size} skill groups`);
+    } catch (err) {
+      log(`skillWriter error: ${err.message}, falling back to claudeMdWriter`);
+      otherRules.push(...methodologyRules);
+    }
+    const writtenPath = claudeMdWriter.writeRulesToClaudeMd(project, otherRules);
+    log(`Solidified: ${otherRules.length} rules → ${writtenPath || 'CLAUDE.md'}`);
+  } else {
+    // No skillWriter or no methodology rules: all go to claudeMdWriter
+    if (methodologyRules.length > 0) {
+      // methodology rules fall back to claudeMdWriter as workflow blocks
+      log(`No skillWriter available, ${methodologyRules.length} methodology rules fall back to claudeMdWriter`);
+    }
+    const writtenPath = claudeMdWriter.writeRulesToClaudeMd(project, finalActive);
+    log(`Solidified: ${finalActive.length} rules → ${writtenPath || 'CLAUDE.md'}`);
+  }
+
+  // --- Skill hints for session-start ---
+  try {
+    const hintsPath = path.join(DATA_DIR, 'skill_hints.json');
+    let hints = { hints: [] };
+    try { hints = JSON.parse(fs.readFileSync(hintsPath, 'utf8')); } catch {}
+
+    // Clean up shown hints
+    hints.hints = hints.hints.filter(h => !h.shown);
+
+    // Add hints for rules that just reached methodology level
+    for (const rule of methodologyRules) {
+      if (!hints.hints.some(h => h.pattern_id === rule.id)) {
+        const kw = (rule.keywords || []).slice(0, 3).join(', ');
+        hints.hints.push({
+          pattern_id: rule.id,
+          message: `Your ${kw} workflow is mature (${rule.sessions_evaluated || 0} sessions). A skill has been created.`,
+          shown: false,
+        });
+      }
+    }
+
+    const hintsTmp = hintsPath + '.tmp';
+    fs.writeFileSync(hintsTmp, JSON.stringify(hints, null, 2) + '\n', 'utf8');
+    fs.renameSync(hintsTmp, hintsPath);
+  } catch (err) {
+    log(`Skill hints error: ${err.message}`);
+  }
+
+  // --- Cross-project pattern store ---
+  try {
+    const XP_PATH = path.join(DATA_DIR, 'cross_project_patterns.json');
+    const projectType = (pending && pending.projectType) || 'general';
+
+    let xpStore;
+    try { xpStore = JSON.parse(fs.readFileSync(XP_PATH, 'utf8')); }
+    catch { xpStore = { version: 1, patterns: [] }; }
+
+    let xpAdded = 0;
+    let xpUpdated = 0;
+
+    for (const rule of finalActive) {
+      if ((rule.score || 0) <= 7) continue;
+      if ((rule.relevance_count || 0) < 5) continue;
+      const cplx = rule.complexity || 'simple';
+      if (cplx === 'simple') continue; // Only compound or higher
+
+      const ruleKeywords = rule.keywords || [];
+      const existing = xpStore.patterns.find(xp =>
+        ruleEngine.jaccardSimilarity(xp.keywords || [], ruleKeywords) > 0.5
+      );
+
+      if (existing) {
+        if ((rule.score || 0) > (existing.score || 0)) {
+          existing.score = rule.score;
+          existing.sessions_observed = (existing.sessions_observed || 0) + 1;
+          xpUpdated++;
+        }
+      } else {
+        xpStore.patterns.push({
+          id: 'xp_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6),
+          project_type: projectType,
+          source_project: project,
+          content: rule.content,
+          complexity: cplx,
+          score: rule.score,
+          keywords: ruleKeywords,
+          sessions_observed: rule.relevance_count || 0,
+          created: new Date().toISOString().slice(0, 10),
+        });
+        xpAdded++;
+      }
+    }
+
+    if (xpAdded > 0 || xpUpdated > 0) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      const xpTmp = XP_PATH + '.tmp';
+      fs.writeFileSync(xpTmp, JSON.stringify(xpStore, null, 2) + '\n', 'utf8');
+      fs.renameSync(xpTmp, XP_PATH);
+      log(`Cross-project store: ${xpAdded} added, ${xpUpdated} updated`);
+    }
+  } catch (err) { log(`XP store error: ${err.message}`); }
 
   // --- Session memory ---
   try {

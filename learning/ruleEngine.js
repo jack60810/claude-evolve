@@ -13,6 +13,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const DATA_DIR = path.join(__dirname, 'data');
 const RULES_PATH = path.join(DATA_DIR, 'rules.json');
@@ -91,6 +92,12 @@ function loadPopulation() {
         })),
       };
     }
+    // Migrate: backfill complexity tracking fields for existing rules
+    for (const rule of data.population || []) {
+      if (!rule.complexity) rule.complexity = 'simple';
+      if (!('content_hash' in rule)) rule.content_hash = null;
+      if (!('skill_path' in rule)) rule.skill_path = null;
+    }
     return data;
   } catch {
     return { version: 2, session_count: 0, population: [] };
@@ -157,7 +164,7 @@ function incrementSession(project) {
 
 // ===================== Add rule =====================
 
-function addRule(project, content, source, keywords, status) {
+function addRule(project, content, source, keywords, status, complexity) {
   const data = loadPopulation();
 
   // Enforce MAX_ACTIVE: if requesting active but at cap, downgrade to candidate
@@ -168,6 +175,7 @@ function addRule(project, content, source, keywords, status) {
   }
 
   const id = generateId();
+  const contentHash = crypto.createHash('sha256').update(content).digest('hex');
   const rule = {
     id, project, content, source,
     keywords: keywords || extractKeywords(content),
@@ -177,6 +185,9 @@ function addRule(project, content, source, keywords, status) {
     created: new Date().toISOString().slice(0, 10),
     status: effectiveStatus,
     dormant_since_session: 0,
+    complexity: complexity || 'simple',
+    content_hash: contentHash,
+    skill_path: null,
   };
   data.population.push(rule);
   savePopulation(data);
@@ -225,6 +236,8 @@ function applyScores(project, evaluations) {
  * @param {string} project
  * @param {number} sessionCount - current global session count
  */
+const COMPLEXITY_LEVELS = ['simple', 'compound', 'workflow', 'methodology'];
+
 function applyLifecycle(project, sessionCount) {
   const data = loadPopulation();
   const demoted = [];
@@ -238,8 +251,23 @@ function applyLifecycle(project, sessionCount) {
     if (rule.status === 'active' && rule.score < 3 && rule.relevance_count >= 3) {
       rule.status = 'dormant';
       rule.dormant_since_session = sessionCount;
-      demoted.push(rule);
-      logChange({ action: 'demoted', rule_id: rule.id, project, score: rule.score, content: rule.content.slice(0, 200) });
+
+      // Track skill file info before complexity downgrade
+      const hadSkillFile = rule.complexity === 'methodology' && !!rule.skill_path;
+      const oldSkillPath = rule.skill_path || null;
+
+      // Downgrade complexity one level
+      const currentLevel = COMPLEXITY_LEVELS.indexOf(rule.complexity || 'simple');
+      if (currentLevel > 0) {
+        rule.complexity = COMPLEXITY_LEVELS[currentLevel - 1];
+      }
+      // Reset scoring for fresh EMA start
+      rule.score = 5;
+      rule.relevance_count = 0;
+      rule.sessions_evaluated = 0;
+
+      demoted.push({ ...rule, had_skill_file: hadSkillFile, old_skill_path: oldSkillPath });
+      logChange({ action: 'demoted', rule_id: rule.id, project, score: rule.score, complexity: rule.complexity, content: rule.content.slice(0, 200) });
     }
 
     // Kill dormant rules that have been dormant too long
@@ -360,6 +388,31 @@ function getPopulationStats(project) {
   };
 }
 
+// ===================== Complexity management =====================
+
+function updateComplexity(project, ruleId, newComplexity, skillPath) {
+  const data = loadPopulation();
+  const rule = data.population.find(r => r.id === ruleId && r.project === project);
+  if (!rule) return null;
+  const oldComplexity = rule.complexity || 'simple';
+  rule.complexity = newComplexity;
+  if (skillPath !== undefined) rule.skill_path = skillPath;
+  savePopulation(data);
+  logChange({ action: 'complexity_change', rule_id: ruleId, project, old: oldComplexity, new: newComplexity, skill_path: rule.skill_path });
+  return rule;
+}
+
+function getRelatedRules(project, rule, threshold) {
+  if (threshold === undefined || threshold === null) threshold = 0.3;
+  const pop = loadPopulation().population;
+  const ruleKw = rule.keywords || extractKeywords(rule.content || '');
+  return pop.filter(r => {
+    if (r.project !== project || r.id === rule.id) return false;
+    const sim = jaccardSimilarity(ruleKw, r.keywords || []);
+    return sim > threshold;
+  });
+}
+
 module.exports = {
   extractKeywords, jaccardSimilarity,
   loadPopulation, savePopulation, loadRules, saveRules,
@@ -370,5 +423,6 @@ module.exports = {
   applyScores, applyLifecycle, evaluateFitness,
   detectConflict, addConflict, getPendingConflicts, resolveConflict,
   isDuplicate, getPopulationStats,
+  updateComplexity, getRelatedRules,
   MAX_ACTIVE,
 };

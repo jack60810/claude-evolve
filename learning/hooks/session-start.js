@@ -64,6 +64,83 @@ function main() {
         }
       } catch {}
 
+      // --- Skill maturity hints ---
+      try {
+        const hintsPath = path.join(LEARNING_ROOT, 'data', 'skill_hints.json');
+        if (fs.existsSync(hintsPath)) {
+          const hints = JSON.parse(fs.readFileSync(hintsPath, 'utf8'));
+          const unshown = (hints.hints || []).filter(h => !h.shown);
+
+          if (unshown.length > 0) {
+            sections.push('[claude-evolve] Skill Update');
+            for (const hint of unshown) {
+              sections.push(`  ${hint.message}`);
+            }
+
+            // Mark as shown
+            for (const hint of unshown) {
+              hint.shown = true;
+            }
+            const tmp = hintsPath + '.tmp';
+            fs.writeFileSync(tmp, JSON.stringify(hints, null, 2) + '\n', 'utf8');
+            fs.renameSync(tmp, hintsPath);
+          }
+        }
+      } catch {}
+
+      // --- Cross-project pattern suggestions ---
+      try {
+        const xpPath = path.join(LEARNING_ROOT, 'data', 'cross_project_patterns.json');
+        if (fs.existsSync(xpPath)) {
+          const xpStore = JSON.parse(fs.readFileSync(xpPath, 'utf8'));
+          const patterns = xpStore.patterns || [];
+
+          if (patterns.length > 0) {
+            const projectPath = process.cwd();
+            const projectName = path.basename(projectPath);
+
+            // Get project type from most recent session log entry
+            const sessionLogPath = path.join(LEARNING_ROOT, 'data', 'session_log.jsonl');
+            let currentProjectType = 'general';
+            if (fs.existsSync(sessionLogPath)) {
+              const logLines = fs.readFileSync(sessionLogPath, 'utf8').trim().split('\n').filter(Boolean);
+              for (let i = logLines.length - 1; i >= Math.max(0, logLines.length - 20); i--) {
+                try {
+                  const entry = JSON.parse(logLines[i]);
+                  if (entry.project === projectName && entry.project_type) {
+                    currentProjectType = entry.project_type;
+                    break;
+                  }
+                } catch {}
+              }
+            }
+
+            // Find patterns matching this project type that don't exist locally
+            const ruleEngine = require(path.join(LEARNING_ROOT, 'ruleEngine'));
+            const activeRules = ruleEngine.getActiveRules(projectPath);
+
+            const suggestions = [];
+            for (const xp of patterns) {
+              if (xp.project_type !== currentProjectType) continue;
+              if (xp.source_project === projectPath) continue;
+              const alreadyExists = activeRules.some(r =>
+                ruleEngine.jaccardSimilarity(r.keywords || [], xp.keywords || []) > 0.5
+              );
+              if (alreadyExists) continue;
+              suggestions.push(xp);
+            }
+
+            if (suggestions.length > 0) {
+              sections.push(`[claude-evolve] Cross-project patterns available (${currentProjectType})`);
+              for (const s of suggestions.slice(0, 3)) {
+                sections.push(`  From ${path.basename(s.source_project)}: "${s.content.slice(0, 100)}"`);
+              }
+              sections.push('  Reply "apply cross-project patterns" to add them to this project');
+            }
+          }
+        }
+      } catch {}
+
       // --- Recent rule changes (compact, last 24h) ---
       try {
         const changelogPath = path.join(LEARNING_ROOT, 'data', 'changelog.jsonl');

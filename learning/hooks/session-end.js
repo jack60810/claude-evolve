@@ -112,6 +112,10 @@ function buildSessionBehaviorFromRecords(records) {
   // Detect workflow phases from tool sequence
   summary.workflowPhases = detectWorkflowPhases(summary.toolSequence);
 
+  // Classify project type from tool patterns
+  const analyzer = require(path.join(LEARNING_ROOT, 'analyzer'));
+  summary.projectType = analyzer.classifyProjectType(summary);
+
   return summary;
 }
 
@@ -227,6 +231,7 @@ function savePendingAndSpawn(projectPath, tempFile, preReadRecords) {
       newMemories,
       observations,
       sessionBehavior,
+      projectType: sessionBehavior.projectType || 'general',
       recentSessions,
       existingActiveRules,
       handWrittenContent,
@@ -298,6 +303,9 @@ function main() {
         const analysis = analyzer.analyzeSession(sessionData);
         analyzer.updateProfile(PROFILE_PATH, analysis);
 
+        // Classify project type for the session log
+        const sessionBehaviorForLog = buildSessionBehaviorFromRecords(records);
+
         const logEntry = {
           timestamp: new Date().toISOString(),
           project: analysis.patterns.project || 'unknown',
@@ -310,6 +318,7 @@ function main() {
             .sort((a, b) => b[1] - a[1])
             .slice(0, 5)
             .map(([t, c]) => `${t}:${c}`),
+          project_type: sessionBehaviorForLog.projectType || 'general',
         };
 
         fs.mkdirSync(path.dirname(SESSION_LOG_PATH), { recursive: true });

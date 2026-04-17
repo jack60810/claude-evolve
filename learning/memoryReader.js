@@ -142,6 +142,37 @@ function getNewFeedbackMemories(projectPath, sessionStartTime) {
 }
 
 /**
+ * Read ALL memories for a project (user, feedback, project, reference).
+ * Used by skill generation to understand the user's thinking patterns.
+ * Returns array of { file, type, name, description, content }
+ */
+function getAllMemories(projectPath) {
+  const memDir = getProjectMemoryDir(projectPath);
+  if (!fs.existsSync(memDir)) return [];
+
+  let files;
+  try { files = fs.readdirSync(memDir); } catch { return []; }
+
+  const memories = [];
+  for (const f of files) {
+    if (!f.endsWith('.md')) continue;
+    const fp = path.join(memDir, f);
+    try {
+      const raw = fs.readFileSync(fp, 'utf8');
+      const parsed = parseFrontmatter(raw);
+      memories.push({
+        file: f,
+        type: parsed.type || 'unknown',
+        name: parsed.name || '',
+        description: parsed.description || '',
+        content: parsed.body || '',
+      });
+    } catch {}
+  }
+  return memories;
+}
+
+/**
  * Determine if a memory describes a multi-step workflow (→ skill)
  * vs a single rule (→ CLAUDE.md rule).
  */
@@ -181,6 +212,6 @@ function extractRuleContent(memory) {
 
 module.exports = {
   encodeProjectPath, getProjectMemoryDir, parseFrontmatter,
-  getSessionStartTime, getNewFeedbackMemories,
+  getSessionStartTime, getNewFeedbackMemories, getAllMemories,
   isWorkflowPattern, extractRuleContent,
 };

@@ -10,7 +10,8 @@ const MANAGED_END = '<!-- claude-evolve:managed-end -->';
 
 function ruleTag(rule) {
   const score = rule.score != null ? rule.score : (rule.fitness != null ? rule.fitness : 5);
-  return `<!-- claude-evolve:rule id=${rule.id} score=${score} created=${rule.created} source=${rule.source} -->`;
+  const complexity = rule.complexity || 'simple';
+  return `<!-- claude-evolve:rule id=${rule.id} score=${score} created=${rule.created} source=${rule.source} complexity=${complexity} -->`;
 }
 const RULE_END = '<!-- /claude-evolve:rule -->';
 
@@ -55,14 +56,45 @@ function buildManagedSection(rules) {
 
   for (const rule of rules) {
     lines.push(ruleTag(rule));
-    // Support multi-line content (distilled rules)
-    const contentLines = rule.content.split('\n');
-    for (const cl of contentLines) {
-      const trimmed = cl.trim();
-      if (!trimmed) continue;
-      // Ensure each line starts with a bullet
-      lines.push(trimmed.startsWith('- ') ? trimmed : '- ' + trimmed);
+    const complexity = rule.complexity || 'simple';
+
+    if (complexity === 'workflow') {
+      // Workflow: numbered steps with optional header, preserve as-is
+      const contentLines = rule.content.split('\n');
+      for (const cl of contentLines) {
+        const trimmed = cl.trim();
+        if (!trimmed) continue;
+        // Preserve headers, numbered steps, and bullets as-is
+        if (/^#{1,6}\s/.test(trimmed) || /^\d+\.\s/.test(trimmed) || trimmed.startsWith('- ')) {
+          lines.push(trimmed);
+        } else {
+          // Default: treat as a numbered step
+          lines.push(trimmed);
+        }
+      }
+    } else if (complexity === 'compound') {
+      // Compound: multi-line bullet list with sub-bullets, preserve indentation
+      const contentLines = rule.content.split('\n');
+      for (const cl of contentLines) {
+        if (!cl.trim()) continue;
+        // Preserve indented sub-bullets (e.g., "  - sub item")
+        if (/^\s+- /.test(cl)) {
+          lines.push(cl);
+        } else {
+          const trimmed = cl.trim();
+          lines.push(trimmed.startsWith('- ') ? trimmed : '- ' + trimmed);
+        }
+      }
+    } else {
+      // Simple (default): single-line or multi-line, each line gets a bullet
+      const contentLines = rule.content.split('\n');
+      for (const cl of contentLines) {
+        const trimmed = cl.trim();
+        if (!trimmed) continue;
+        lines.push(trimmed.startsWith('- ') ? trimmed : '- ' + trimmed);
+      }
     }
+
     lines.push(RULE_END);
     lines.push('');
   }
