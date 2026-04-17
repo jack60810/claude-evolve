@@ -52,19 +52,38 @@ Skills live in `.claude/skills/auto-*.md`. They follow the standard Claude Code 
 
 Cross-project transfer: when you start a new project of the same type (e.g., another analysis project), the system suggests patterns it learned from your other projects.
 
-### Validated with real simulation
+### Validated with deep simulation
 
-We tested this by simulating 3 different analysts (Alice, Bob, Carol) doing 6 different analysis tasks (retention, funnel, segmentation, trends, churn, ARPU). Each analyst had a different style, but the system found their shared methodology automatically:
+We tested this by simulating 5 deep analysis sessions (13-16 tool calls each) across different tasks: retention cohorts, onboarding funnels, A/B test evaluation, user segmentation. The system produced a skill called `auto-bq-safe-analysis`:
 
+```markdown
+## Thinking Model
+
+This user's core mental model is cost-aware, correctness-first analytics.
+
+What they care about most, in order: (1) cost safety, (2) correctness, (3) speed.
+
+Never run a full query without dry_run. If estimated bytes > 100 GB, don't ask —
+just tighten the filter and re-run. If sub-group totals don't add up, flag it
+before moving on.
+
+## What NOT to Do
+- Never skip dry_run, even for "quick" queries
+- Never present A/B results with just one metric — compute the full significance block
+- Never skip notes.md at the end of an analysis
 ```
-3 analysts × 2 tasks each = 6 sessions
-→ 10 rules extracted from observed behavior
-→ 1 skill generated capturing the common thinking model:
-  "Progressive commitment: spend minimum cost to validate at each stage
-   before committing to a larger, more expensive step."
-```
 
-No analyst explicitly taught these patterns. The system inferred them from tool usage sequences across sessions.
+No one explicitly taught these patterns. The system inferred them from tool usage sequences, user corrections (feedback memories), and cross-session consistency.
+
+The test is parameterized for any profession:
+
+```bash
+node test/integration-deep-session.js analyst          # data analyst (default)
+node test/integration-deep-session.js backend-engineer  # backend dev
+node test/integration-deep-session.js devops            # devops/infra
+node test/integration-deep-session.js frontend-engineer # frontend dev
+node test/integration-deep-session.js random            # LLM picks a random profession
+```
 
 ## When this helps / When it doesn't
 
