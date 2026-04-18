@@ -34,12 +34,24 @@
 
 <!-- claude-evolve:managed-start -->
 
-<!-- claude-evolve:rule id=r_mo20mhnz_7jza score=5 created=2026-04-16 source=observation -->
+<!-- claude-evolve:rule id=r_mo20mhnz_7jza score=5 created=2026-04-16 source=observation complexity=simple -->
 - When syncing files between two mirrored repos, use a loop with explicit path mapping and immediately verify both repos are identical after the copy (e.g., diff or checksum comparison).
 <!-- /claude-evolve:rule -->
 
-<!-- claude-evolve:rule id=r_mo20plpv_0znr score=5 created=2026-04-16 source=observation -->
+<!-- claude-evolve:rule id=r_mo20plpv_0znr score=5 created=2026-04-16 source=observation complexity=simple -->
 - When verifying a dependency's license, cross-check all three sources in parallel: local LICENSE file, package.json license field, and upstream GitHub API (`gh api repos/<owner>/<repo> --jq '.license.spdx_id'`) — conflicts between them require fetching the raw LICENSE file content to resolve definitively.
+<!-- /claude-evolve:rule -->
+
+<!-- claude-evolve:rule id=r_mo4aod2m_8ogc score=5.3 created=2026-04-18 source=observation complexity=simple -->
+- When auditing two mirrored repos for divergence, run `diff -rq` first to identify which files differ, then read only those diverged files — do not read files that are identical.
+<!-- /claude-evolve:rule -->
+
+<!-- claude-evolve:rule id=r_mo4aod2q_549p score=5 created=2026-04-18 source=observation complexity=simple -->
+- When comparing mirrored repos, check `git log` on both sides before reading any files — commit history reveals which repo is ahead and frames what diffs mean.
+<!-- /claude-evolve:rule -->
+
+<!-- claude-evolve:rule id=r_mo4aod2r_78xu score=5 created=2026-04-18 source=observation complexity=simple -->
+- When exploring an unfamiliar repo structure, run `ls` on key subdirectories in parallel (e.g., src/, learning/, hooks/) before opening individual files — avoids blind reads.
 <!-- /claude-evolve:rule -->
 
 <!-- claude-evolve:managed-end -->

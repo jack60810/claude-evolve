@@ -311,7 +311,7 @@ function main() {
           project: analysis.patterns.project || 'unknown',
           tool_calls: analysis.totalToolCalls,
           signals: analysis.signals,
-          matched_genes: analysis.matched.map(m => m.gene),
+          matched_genes: (analysis.matched || []).map(m => m.gene),
           db_queries: sessionData.dbQueries.length,
           mcp_queries: sessionData.mcpQueries.length,
           top_tools: Object.entries(sessionData.tools)
@@ -348,6 +348,14 @@ function main() {
 
       process.stdout.write(JSON.stringify(msg ? { additionalContext: msg } : {}));
     } catch (e) {
+      try {
+        fs.mkdirSync(path.join(LEARNING_ROOT, 'data'), { recursive: true });
+        fs.appendFileSync(
+          path.join(LEARNING_ROOT, 'data', 'rule_errors.log'),
+          new Date().toISOString() + ' [session-end main] ' + (e.stack || e.message || e) + '\n',
+          'utf8'
+        );
+      } catch {}
       process.stdout.write(JSON.stringify({}));
     }
   });
