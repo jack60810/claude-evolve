@@ -22,6 +22,123 @@ The demo:
 
 You'll see, in real output, the skill the system learned — the user's **thinking model**, not just their steps. Different profession = different skill. No hardcoded templates.
 
+### Two example outputs (not for programmers)
+
+To show this isn't just a coding tool — here are two skills the system
+produced, each from 3 simulated sessions of someone doing their real job.
+No code involved, no hardcoded templates, no pre-written rules.
+
+<details>
+<summary><b>Example 1: Kindergarten Principal</b> — admin work (scheduling, classroom observations, budgets)</summary>
+
+```markdown
+---
+name: auto-kindergarten-ops-discipline
+description: >
+  This user thinks in terms of "verify before commit" — never finalize anything
+  without cross-checking all dependencies first. They prioritize correctness and
+  accountability over speed, and expect proactive conflict detection, not reactive fixes.
+triggers:
+  - schedule parent conferences
+  - staff duty assignments
+  - classroom observation
+  - field trip budget
+  - enrollment tracker
+---
+
+## Thinking Model
+
+This user's core mental model: **incomplete information = don't commit**. Every
+scheduling, assignment, or financial decision must be fully verified before it's
+treated as final.
+
+**Proactive behaviors — don't wait to be asked:**
+- When scheduling anything involving multiple people, cross-check availability,
+  preferences, AND form data in parallel — not sequentially. Assume conflicts
+  exist until proven otherwise.
+- When a staff member hasn't responded, flag them explicitly. Never assume
+  silence = agreement.
+- When reviewing any tracker with status flags (e.g., "inactive"), always
+  cross-check against the actual source of truth (e.g., payment records).
+
+**Corrections this user makes to Claude:**
+- Generic templates are wrong — observation rubrics must be tailored per
+  teacher/classroom.
+- Attaching lesson plans to substitute coverage isn't optional — it's part of
+  the confirmation step.
+- Feedback documents aren't complete without a specific strength, a growth
+  item, AND a follow-up date.
+
+## What NOT to Do
+
+- Don't finalize a schedule with unconfirmed participants — always flag who
+  hasn't replied.
+- Don't use a generic observation rubric across teachers — always customize.
+- Don't send substitute confirmation without lesson plan materials attached.
+- Don't approve a budget as a lump sum — itemization is required before any
+  approval.
+```
+
+</details>
+
+<details>
+<summary><b>Example 2: Bus Driver</b> — safety ops (pre-trip checks, fault diagnosis, route changes)</summary>
+
+```markdown
+---
+name: auto-safety-first-ops
+description: >
+  Captures the user's safety-before-action thinking model: always diagnose before fixing,
+  always verify after repairing, and always communicate before acting on safety-blocking issues.
+  The mental model is "sequence integrity" — doing things out of order creates compounding risk.
+triggers:
+  - pre-trip check
+  - system diagnostic
+  - route disruption
+  - maintenance action
+  - boarding passengers
+---
+
+## Thinking Model
+
+This user runs a **safety-gated operations loop**. Every action must pass through:
+Diagnose → Communicate → Act → Verify. Skipping any step — even for a "quick fix"
+— is the error they correct most often.
+
+**What they care about most: sequence integrity and root cause, not speed.**
+
+- Never assume a surface fix resolves the underlying problem. Low tire pressure
+  isn't "inflated and done" — it's "why was it low?" until proven otherwise.
+- Safety-blocking issues broadcast first, fix second. Communication isn't a
+  follow-up; it's the first action.
+- Pre-trip and system checks are a gate, not a formality. Passengers never
+  board before all checks clear — no exceptions, no reversals.
+- Graceful degradation matters: fare failures need a fallback path ready
+  *before* a passenger is at the scanner, not after they're blocking the queue.
+
+## What NOT to Do
+
+- **Don't inflate and proceed.** Restoring tire pressure without diagnosing
+  the root cause is a false fix. It may warrant a maintenance hold.
+- **Don't mark pre-trip PASS after a patch.** A fix without root cause
+  confirmation doesn't clear the check.
+- **Don't fix before communicating.** Safety-blocking issues require
+  notification first, always.
+- **Don't board before all checks clear.** No scenario where loading precedes
+  system verification.
+- **Don't assume payment will succeed.** Design for failure at the scanner,
+  not after it.
+```
+
+</details>
+
+Two completely different jobs → two completely different thinking models.
+The principal's skill is about *correctness*. The driver's skill is about
+*sequence*. Both inferred from behavior alone.
+
+Try your own: `node demo.js chef`, `emergency-nurse`, `security-guard`,
+`game-developer`, or `random`.
+
 ## The thing that matters most: anti-pattern detection
 
 Other tools wait for you to say "don't do that." claude-evolve watches the full session timeline — every Read, Edit, Bash, every MCP call — and spots suboptimal behaviors on its own.
