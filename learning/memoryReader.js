@@ -6,6 +6,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { resolveProjectRoot, realpathOr } = require('./paths');
 
 /**
  * Encode a project path to the Claude Code memory directory path.
@@ -14,112 +15,136 @@ const os = require('os');
  */
 function encodeProjectPath(projectPath) {
   let resolved = projectPath;
-  try { resolved = require('fs').realpathSync(projectPath); } catch {}
+  try { resolved = fs.realpathSync(projectPath); } catch {}
   return resolved.replace(/\//g, '-');
 }
 
 /**
  * Find the Claude Code project memory directory for a given project path.
- * Tries both raw and symlink-resolved paths (e.g., /tmp vs /private/tmp on macOS).
+ * Tries the symlink-resolved and raw paths (e.g., /tmp vs /private/tmp on macOS), each
+ * encoded both ways: "/" → "-", and every non-alphanumeric → "-" (Claude Code's slug).
  */
 function getProjectMemoryDir(projectPath) {
   const baseDir = path.join(os.homedir(), '.claude', 'projects');
+  let resolved = projectPath;
+  try { resolved = fs.realpathSync(projectPath); } catch {}
 
-  // Try resolved path first (what process.cwd() returns)
-  const resolvedEncoded = encodeProjectPath(projectPath);
-  const resolvedDir = path.join(baseDir, resolvedEncoded, 'memory');
-  if (fs.existsSync(resolvedDir)) return resolvedDir;
+  const candidates = [];
+  for (const p of [resolved, projectPath]) {
+    for (const slug of [p.replace(/\//g, '-'), p.replace(/[^A-Za-z0-9]/g, '-')]) {
+      const dir = path.join(baseDir, slug, 'memory');
+      if (!candidates.includes(dir)) candidates.push(dir);
+    }
+  }
+  return candidates.find(d => fs.existsSync(d)) || candidates[0];
+}
 
-  // Try raw path (what the user might have used)
-  const rawEncoded = projectPath.replace(/\//g, '-');
-  const rawDir = path.join(baseDir, rawEncoded, 'memory');
-  if (fs.existsSync(rawDir)) return rawDir;
+/**
+ * Memory files for a launch directory. Claude Code may key auto-memory by the launch folder
+ * or by its git root, so both memory dirs are read (when they differ) and the union is
+ * returned, deduped by file path. Returns [{ f, fp }].
+ */
+function listMemoryFiles(projectPath) {
+  const dirs = [getProjectMemoryDir(projectPath)];
+  try {
+    const { root } = resolveProjectRoot(projectPath);
+    if (root) dirs.push(getProjectMemoryDir(root));
+  } catch {}
 
-  // Fallback to resolved
-  return resolvedDir;
+  const seen = new Set();
+  const files = [];
+  for (const dir of new Set(dirs.map(d => realpathOr(d)))) {
+    let names;
+    try { names = fs.readdirSync(dir); } catch { continue; }
+    for (const f of names) {
+      const fp = path.join(dir, f);
+      if (!f.endsWith('.md') || seen.has(fp)) continue;
+      seen.add(fp);
+      files.push({ f, fp });
+    }
+  }
+  return files;
+}
+
+function unquote(value) {
+  const v = value.trim();
+  if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+    return v.slice(1, -1);
+  }
+  return v;
 }
 
 /**
  * Parse YAML-ish frontmatter from a memory .md file.
+ * Reads top-level `key: value` and one level of nesting:
+ *   metadata:
+ *     type: feedback
+ * becomes result.metadata = { type: 'feedback' }. A nested `type` also fills a missing
+ * top-level `type`, so old flat files and new nested files read the same way.
  */
 function parseFrontmatter(text) {
-  const match = text.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+  const match = String(text).replace(/\r\n/g, '\n').match(/^\uFEFF?---\n([\s\S]*?)\n---[ \t]*(?:\n|$)([\s\S]*)$/);
   if (!match) return { body: text };
 
-  const frontmatter = match[1];
-  const body = match[2].trim();
-  const result = { body };
+  const result = { body: match[2].trim() };
+  let block = null;
 
-  for (const line of frontmatter.split('\n')) {
-    const kv = line.match(/^(\w+):\s*(.+)$/);
-    if (kv) {
-      let value = kv[2].trim();
-      // Remove surrounding quotes if present
-      if ((value.startsWith('"') && value.endsWith('"')) ||
-          (value.startsWith("'") && value.endsWith("'"))) {
-        value = value.slice(1, -1);
-      }
-      result[kv[1]] = value;
+  for (const line of match[1].split('\n')) {
+    const nested = line.match(/^[ \t]+([\w-]+):[ \t]*(.*)$/);
+    if (nested && block) {
+      result[block][nested[1]] = unquote(nested[2]);
+      continue;
+    }
+    const kv = line.match(/^([\w-]+):[ \t]*(.*)$/);
+    if (!kv) continue;
+    if (kv[2].trim() === '') {
+      block = kv[1];
+      result[block] = {};
+    } else {
+      block = null;
+      result[kv[1]] = unquote(kv[2]);
     }
   }
 
+  for (const [k, v] of Object.entries(result)) {
+    if (v && typeof v === 'object' && typeof v.type === 'string' && !result.type) result.type = v.type;
+    if (v && typeof v === 'object' && Object.keys(v).length === 0) delete result[k];
+  }
   return result;
 }
 
 /**
- * Get session start time by checking the temp file created by post-tool.js.
+ * Session start time from the session record in an observation temp file.
+ * Falls back to 3 hours ago (generous window) when the file or record is missing.
  */
-function getSessionStartTime() {
-  const tmpDir = os.tmpdir();
+function getSessionStartTime(observationFile) {
   try {
-    const files = fs.readdirSync(tmpDir)
-      .filter(f => f.startsWith('claude-learning-') && f.endsWith('.jsonl'))
-      .map(f => {
-        const fp = path.join(tmpDir, f);
-        try {
-          const stat = fs.statSync(fp);
-          return { path: fp, ctimeMs: stat.ctimeMs, mtimeMs: stat.mtimeMs };
-        } catch { return null; }
-      })
-      .filter(Boolean)
-      .sort((a, b) => b.mtimeMs - a.mtimeMs);
-
-    if (files.length > 0) {
-      // Use creation time of most recent temp file as session start
-      return files[0].ctimeMs;
+    for (const line of fs.readFileSync(observationFile, 'utf8').split('\n')) {
+      if (!line.includes('"session"')) continue;
+      const rec = JSON.parse(line);
+      if (rec.type === 'session' && Number.isFinite(rec.startMs)) return rec.startMs;
     }
   } catch {}
-
-  // Fallback: 3 hours ago (generous window)
   return Date.now() - 3 * 60 * 60 * 1000;
 }
 
 /**
- * Read new feedback memories created during this session.
+ * Read new feedback memories created during this session (memory type `feedback`,
+ * flat or nested frontmatter, modified at or after sessionStartTime).
  * Returns array of { file, name, description, content, source, mtime }
  */
 function getNewFeedbackMemories(projectPath, sessionStartTime) {
-  const memDir = getProjectMemoryDir(projectPath);
-
-  if (!fs.existsSync(memDir)) return [];
-
-  let files;
-  try {
-    files = fs.readdirSync(memDir);
-  } catch { return []; }
-
+  const since = Number.isFinite(sessionStartTime) ? sessionStartTime : getSessionStartTime(null);
   const memories = [];
 
-  for (const f of files) {
-    // Only look at feedback memories
-    if (!f.startsWith('feedback_') || !f.endsWith('.md')) continue;
+  for (const { f, fp } of listMemoryFiles(projectPath)) {
+    if (f === 'MEMORY.md') continue;
 
-    const fp = path.join(memDir, f);
     let stat;
     try { stat = fs.statSync(fp); } catch { continue; }
 
     // Only pick up files modified during this session
-    if (stat.mtimeMs < sessionStartTime) continue;
+    if (stat.mtimeMs < since) continue;
 
     try {
       const raw = fs.readFileSync(fp, 'utf8');
@@ -147,16 +172,8 @@ function getNewFeedbackMemories(projectPath, sessionStartTime) {
  * Returns array of { file, type, name, description, content }
  */
 function getAllMemories(projectPath) {
-  const memDir = getProjectMemoryDir(projectPath);
-  if (!fs.existsSync(memDir)) return [];
-
-  let files;
-  try { files = fs.readdirSync(memDir); } catch { return []; }
-
   const memories = [];
-  for (const f of files) {
-    if (!f.endsWith('.md')) continue;
-    const fp = path.join(memDir, f);
+  for (const { f, fp } of listMemoryFiles(projectPath)) {
     try {
       const raw = fs.readFileSync(fp, 'utf8');
       const parsed = parseFrontmatter(raw);
@@ -211,7 +228,7 @@ function extractRuleContent(memory) {
 }
 
 module.exports = {
-  encodeProjectPath, getProjectMemoryDir, parseFrontmatter,
+  encodeProjectPath, getProjectMemoryDir, listMemoryFiles, parseFrontmatter,
   getSessionStartTime, getNewFeedbackMemories, getAllMemories,
   isWorkflowPattern, extractRuleContent,
 };

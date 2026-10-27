@@ -4,8 +4,8 @@
 // Pick any profession. The system:
 //   1. Generates N realistic deep work sessions for that profession
 //   2. Observes tool usage, extracts patterns, scores them
-//   3. Promotes mature patterns to a .claude/skills/ methodology file
-//   4. Writes a Skill Routing block into CLAUDE.md
+//   3. Promotes mature patterns to a .claude/skills/auto-<slug>/SKILL.md methodology file
+//   4. Writes the rules and a Skill Routing block into CLAUDE.local.md
 //
 // Usage:
 //   node demo.js analyst                      # defaults: 3 sessions, 8 tool calls each, parallel
@@ -41,7 +41,13 @@ const NUM_SESSIONS = Math.min(10, Math.max(1, parseInt(getFlag('sessions', '3'),
 const DEPTH = Math.min(20, Math.max(5, parseInt(getFlag('depth', '8'), 10)));
 const SEQUENTIAL = hasFlag('sequential');
 const MODEL = getFlag('model', 'haiku');
-const DEMO_ROOT = path.join(__dirname, 'demo-output', `${PROFESSION}-${Date.now().toString(36)}`);
+const DEMO_ROOT = path.join(fs.realpathSync(__dirname), 'demo-output', `${PROFESSION}-${Date.now().toString(36)}`);
+
+// The demo learns into its own data directory, so your real learning data is never read or
+// written. Set before any learning module loads; the pipeline child processes inherit it.
+const DEMO_DATA = `${DEMO_ROOT}-data`;
+process.env.CLAUDE_EVOLVE_DATA_DIR = DEMO_DATA;
+const { CHILD_ENV } = require('./learning/paths');
 
 // ===================== Pretty printing =====================
 
@@ -75,7 +81,7 @@ function askClaude(prompt, model, retries) {
       '--allowedTools', '', '--no-session-persistence', '--max-turns', '1',
     ], {
       input: prompt, encoding: 'utf8', timeout: 180000,
-      env: { ...process.env, EVOLVER_CHILD: '1' },
+      env: { ...process.env, [CHILD_ENV]: '1' },
     });
     if (result.error) {
       if (attempt < maxRetries) continue;
@@ -99,7 +105,7 @@ function askClaudeAsync(prompt, model) {
       '--print', '--model', model || MODEL,
       '--system-prompt', 'You are a JSON generator. Output ONLY raw JSON — no markdown fences, no explanation.',
       '--allowedTools', '', '--no-session-persistence', '--max-turns', '1',
-    ], { env: { ...process.env, EVOLVER_CHILD: '1' } });
+    ], { env: { ...process.env, [CHILD_ENV]: '1' } });
 
     let stdout = '';
     let killed = false;
@@ -119,15 +125,16 @@ function askClaudeAsync(prompt, model) {
 }
 
 function runPipeline(pendingPath, cwd) {
+  const env = { ...process.env };
+  delete env[CHILD_ENV];
   return spawnSync('node', [path.join(LEARNING_ROOT, 'processRules.js'), pendingPath], {
-    encoding: 'utf8', timeout: 300000, cwd,
-    env: { ...process.env, EVOLVER_CHILD: '0' },
+    encoding: 'utf8', timeout: 300000, cwd, env,
   });
 }
 
 /** Stream process.log so user sees pipeline activity live. */
 function tailProcessLog(sinceMtime) {
-  const logPath = path.join(LEARNING_ROOT, 'data', 'process.log');
+  const logPath = path.join(DEMO_DATA, 'process.log');
   if (!fs.existsSync(logPath)) return { stop: () => {} };
 
   let lastSize = fs.existsSync(logPath) ? fs.statSync(logPath).size : 0;
@@ -237,7 +244,7 @@ function buildPending(project, observations) {
   else if (toolCounts['Bash'] > 6) projectType = 'infra';
 
   return {
-    project, timestamp: new Date().toISOString(),
+    project, cwd: project, timestamp: new Date().toISOString(),
     newMemories: [], observations,
     sessionBehavior: {
       toolCalls: observations.length, toolSequence, toolCounts,
@@ -266,13 +273,28 @@ async function main() {
   console.log(`${colors.dim}Estimated: ~${est} minutes${colors.reset}\n`);
 
   fs.mkdirSync(DEMO_ROOT, { recursive: true });
+  fs.mkdirSync(DEMO_DATA, { recursive: true });
+  fs.writeFileSync(path.join(DEMO_DATA, 'process.log'), ''); // so the live tail has a file to follow
   fs.writeFileSync(path.join(DEMO_ROOT, 'CLAUDE.md'),
     `# CLAUDE.md\n## Project\n${PROFESSION} workspace (demo)\n`);
+  // demo-output sits inside this repo. Its own git repo makes the demo folder resolve as the
+  // project root, so rules land here and not in this repo's CLAUDE.local.md.
+  const gitInit = spawnSync('git', ['init', '-q'], { cwd: DEMO_ROOT, encoding: 'utf8' });
+  if (gitInit.status !== 0) {
+    throw new Error(`git init failed in ${DEMO_ROOT}: ${gitInit.error ? gitInit.error.message : gitInit.stderr}`);
+  }
 
   const ruleEngine = require(path.join(LEARNING_ROOT, 'ruleEngine'));
-  const data = ruleEngine.loadPopulation();
-  data.population = data.population.filter(r => !r.project.includes('/demo-output/'));
-  ruleEngine.savePopulation(data);
+  const claudeMdWriter = require(path.join(LEARNING_ROOT, 'claudeMdWriter'));
+
+  /** Skill files the pipeline wrote: .claude/skills/auto-<slug>/SKILL.md */
+  const listSkills = () => {
+    const dir = path.join(DEMO_ROOT, '.claude', 'skills');
+    if (!fs.existsSync(dir)) return [];
+    return fs.readdirSync(dir)
+      .map(name => path.join(dir, name, 'SKILL.md'))
+      .filter(f => fs.existsSync(f));
+  };
 
   // Step 1: Profession
   header('Step 1 — Define the profession');
@@ -398,19 +420,17 @@ async function main() {
   // Step 5: Show outputs
   header('Step 5 — What the system learned');
 
-  const claudeMdPath = path.join(DEMO_ROOT, 'CLAUDE.md');
-  const skillDir = path.join(DEMO_ROOT, '.claude', 'skills');
+  const rulesFile = claudeMdWriter.rulesFilePath(DEMO_ROOT);
+  const skills = listSkills();
 
-  console.log(`${colors.bold}${colors.green}▶ CLAUDE.md${colors.reset}`);
+  console.log(`${colors.bold}${colors.green}▶ ${path.basename(rulesFile)}${colors.reset}`);
   console.log(`${colors.dim}${'─'.repeat(64)}${colors.reset}`);
-  console.log(fs.readFileSync(claudeMdPath, 'utf8'));
+  console.log(fs.existsSync(rulesFile) ? fs.readFileSync(rulesFile, 'utf8') : '(no rules were written)\n');
 
-  if (fs.existsSync(skillDir)) {
-    for (const s of fs.readdirSync(skillDir).filter(f => f.endsWith('.md'))) {
-      console.log(`\n${colors.bold}${colors.green}▶ .claude/skills/${s}${colors.reset}`);
-      console.log(`${colors.dim}${'─'.repeat(64)}${colors.reset}`);
-      console.log(fs.readFileSync(path.join(skillDir, s), 'utf8'));
-    }
+  for (const sk of skills) {
+    console.log(`\n${colors.bold}${colors.green}▶ ${path.relative(DEMO_ROOT, sk)}${colors.reset}`);
+    console.log(`${colors.dim}${'─'.repeat(64)}${colors.reset}`);
+    console.log(fs.readFileSync(sk, 'utf8'));
   }
 
   // Summary
@@ -420,15 +440,10 @@ async function main() {
   console.log(`  Profession:        ${profession.title}`);
   console.log(`  Sessions:          ${sessions.length}/${NUM_SESSIONS} succeeded, ${DEPTH} tool calls each`);
   console.log(`  Rules:             ${finalStats.active} active, ${finalStats.dormant} dormant`);
-  console.log(`  Skills:            ${fs.existsSync(skillDir) ? fs.readdirSync(skillDir).filter(f => f.endsWith('.md')).length : 0}`);
+  console.log(`  Skills:            ${skills.length}`);
   console.log(`  Total time:        ${totalTime}s`);
   console.log(`\n  Output: ${colors.blue}${DEMO_ROOT}${colors.reset}`);
-
-  // Clean up demo rules
-  const d2 = ruleEngine.loadPopulation();
-  d2.population = d2.population.filter(r => r.project !== DEMO_ROOT);
-  ruleEngine.savePopulation(d2);
-  console.log(`  ${colors.green}✓${colors.reset} Demo rules removed — your real learning is untouched\n`);
+  console.log(`  ${colors.green}✓${colors.reset} Demo data kept in ${DEMO_DATA} — your real learning data was never touched\n`);
 }
 
 main().catch(err => {

@@ -17,13 +17,13 @@
     {
       "id": "gene_optimize",
       "trigger": "periodic",
-      "description": "Evaluate and score existing rules. Demote underperformers.",
+      "description": "LLM scores active rules and may revive dormant ones. Decay, demotion, promotion and TTL pruning run every session.",
       "signals": ["periodic_check"]
     },
     {
       "id": "gene_cleanup",
       "trigger": "many_rules",
-      "description": "Too many active rules. Merge or remove redundant ones.",
+      "description": "Too many active rules. Merge, rewrite or remove; merged rules pass the contradiction check.",
       "signals": ["many_rules"]
     },
     {

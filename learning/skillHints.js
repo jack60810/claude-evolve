@@ -2,43 +2,41 @@
 // skillHints.js — Manage skill maturity hints for session-start injection
 // Extracted from processRules.js for P3 refactor.
 
-const fs = require('fs');
 const path = require('path');
+const { DATA_DIR } = require('./paths');
+const { readJson, writeJsonAtomic, withLock } = require('./fsutil');
 
-const DATA_DIR = path.join(__dirname, 'data');
 const HINTS_PATH = path.join(DATA_DIR, 'skill_hints.json');
 
 /**
- * Update skill hints after solidify.
+ * Update skill hints after solidify (locked read-modify-write; session-start marks them shown).
  * Cleans up shown hints, adds new ones for methodology-level rules.
  * @param {Array} methodologyRules - Rules at methodology complexity level
  * @param {Function} log - Logging function
  */
 function updateHints(methodologyRules, log) {
   try {
-    let hints = { hints: [] };
-    try { hints = JSON.parse(fs.readFileSync(HINTS_PATH, 'utf8')); } catch {}
+    withLock(HINTS_PATH, () => {
+      const hints = readJson(HINTS_PATH, () => ({ hints: [] }));
+      const before = JSON.stringify(hints);
+      hints.hints = (hints.hints || []).filter(h => !h.shown);
 
-    hints.hints = hints.hints.filter(h => !h.shown);
-
-    for (const rule of (methodologyRules || [])) {
-      if (!hints.hints.some(h => h.pattern_id === rule.id)) {
-        const kw = (rule.keywords || []).slice(0, 3).join(', ');
-        hints.hints.push({
-          pattern_id: rule.id,
-          message: `Your ${kw} workflow is mature (${rule.sessions_evaluated || 0} sessions). A skill has been created.`,
-          shown: false,
-        });
+      for (const rule of (methodologyRules || [])) {
+        if (!hints.hints.some(h => h.pattern_id === rule.id)) {
+          const kw = (rule.keywords || []).slice(0, 3).join(', ');
+          hints.hints.push({
+            pattern_id: rule.id,
+            message: `Your ${kw} workflow is mature (${rule.sessions_evaluated || 0} sessions). A skill has been created.`,
+            shown: false,
+          });
+        }
       }
-    }
 
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    const tmp = HINTS_PATH + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(hints, null, 2) + '\n', 'utf8');
-    fs.renameSync(tmp, HINTS_PATH);
+      if (JSON.stringify(hints) !== before) writeJsonAtomic(HINTS_PATH, hints);
+    });
   } catch (err) {
     if (log) log(`Skill hints error: ${err.message}`);
   }
 }
 
-module.exports = { updateHints };
+module.exports = { updateHints, HINTS_PATH };

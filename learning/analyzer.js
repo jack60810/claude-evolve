@@ -7,8 +7,10 @@
 
 const fs = require('fs');
 const path = require('path');
+const { DATA_DIR } = require('./paths');
+const { readJson, writeJsonAtomic, withLock } = require('./fsutil');
 
-const DEFAULT_PROFILE_PATH = path.join(__dirname, 'data', 'user_profile.json');
+const DEFAULT_PROFILE_PATH = path.join(DATA_DIR, 'user_profile.json');
 
 // ===================== Session analysis =====================
 
@@ -79,10 +81,14 @@ function readProfile(profilePath) {
   }
 }
 
+// Read-modify-write under a lock: several sessions can end at once. A corrupt profile
+// throws (readJson) instead of being silently replaced by an empty one.
 function updateProfile(profilePath, analysis) {
   const p = profilePath || DEFAULT_PROFILE_PATH;
-  const profile = readProfile(p);
+  return withLock(p, () => applyAnalysis(p, readJson(p, createEmptyProfile), analysis));
+}
 
+function applyAnalysis(p, profile, analysis) {
   profile.last_updated = new Date().toISOString();
   profile.session_count = (profile.session_count || 0) + 1;
 
@@ -121,12 +127,7 @@ function updateProfile(profilePath, analysis) {
     profile.project_activity[pat.project] = (profile.project_activity[pat.project] || 0) + 1;
   }
 
-  // Write
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  const tmp = p + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(profile, null, 2) + '\n', 'utf8');
-  fs.renameSync(tmp, p);
-
+  writeJsonAtomic(p, profile);
   return profile;
 }
 

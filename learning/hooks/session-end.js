@@ -1,40 +1,36 @@
 #!/usr/bin/env node
-// session-end.js — Stop hook
-// 1. Aggregates session tool usage, runs analyzer, updates profile (existing)
-// 2. Saves pending rule learning data + spawns background LLM processor
+// session-end.js — SessionEnd hook (runs once per session)
+// 1. Claims this session's observation file by renaming it to <file>.processing
+// 2. Aggregates tool usage, updates the user profile, appends to session_log.jsonl
+// 3. For non-trivial sessions in a project root: writes DATA_DIR/pending_<sessionId>.json and
+//    spawns the background processor (processRules.js), the single writer of rules,
+//    CLAUDE.md and skills. This file never touches any of those.
+//
+// `node session-end.js --sweep <claimedFile>` runs steps 2-3 on a file that session-start
+// claimed from a session that never fired SessionEnd.
 
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
 const { spawn } = require('child_process');
 
 const LEARNING_ROOT = path.join(__dirname, '..');
-const ANALYZER_PATH = path.join(LEARNING_ROOT, 'analyzer.js');
-const PROFILE_PATH = path.join(LEARNING_ROOT, 'data', 'user_profile.json');
-const SESSION_LOG_PATH = path.join(LEARNING_ROOT, 'data', 'session_log.jsonl');
-const PENDING_PATH = path.join(LEARNING_ROOT, 'data', 'pending.json');
+const { DATA_DIR, CHILD_ENV, resolveProjectRoot } = require(path.join(LEARNING_ROOT, 'paths'));
+const { writeJsonAtomic, appendBounded } = require(path.join(LEARNING_ROOT, 'fsutil'));
+const { redact } = require(path.join(LEARNING_ROOT, 'redact'));
+const sessionMemory = require(path.join(LEARNING_ROOT, 'sessionMemory'));
+
+const PROFILE_PATH = path.join(DATA_DIR, 'user_profile.json');
+const SESSION_LOG_PATH = path.join(DATA_DIR, 'session_log.jsonl');
+const PROCESS_LOG = path.join(DATA_DIR, 'process.log');
+const ERROR_LOG = path.join(DATA_DIR, 'hook_errors.log');
 const PROCESS_SCRIPT = path.join(LEARNING_ROOT, 'processRules.js');
+const MAX_LOG_BYTES = 1024 * 1024;
 
-// ===================== Tool aggregation (existing) =====================
-
-function findSessionTempFile() {
-  const prefix = `claude-learning-${process.ppid || 'unknown'}`;
-  const tmpDir = os.tmpdir();
-  try {
-    const files = fs.readdirSync(tmpDir)
-      .filter(f => f.startsWith('claude-learning-') && f.endsWith('.jsonl'))
-      .map(f => path.join(tmpDir, f))
-      .sort((a, b) => {
-        try { return fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs; }
-        catch { return 0; }
-      });
-    const exact = files.find(f => path.basename(f).startsWith(prefix));
-    if (exact) return exact;
-    if (files.length > 0) return files[0];
-  } catch {}
-  return null;
+function logError(where, err) {
+  try { appendBounded(ERROR_LOG, `${new Date().toISOString()} [session-end ${where}] ${err && err.stack || err}`); } catch {}
 }
 
+// ===================== Tool aggregation =====================
 
 function aggregateSession(records) {
   const tools = {};
@@ -52,22 +48,6 @@ function aggregateSession(records) {
   return { tools, dbQueries, mcpQueries };
 }
 
-function cleanupTempFiles() {
-  const tmpDir = os.tmpdir();
-  try {
-    const files = fs.readdirSync(tmpDir)
-      .filter(f => f.startsWith('claude-learning-') && f.endsWith('.jsonl'));
-    const now = Date.now();
-    for (const f of files) {
-      const fp = path.join(tmpDir, f);
-      try {
-        const stat = fs.statSync(fp);
-        if (now - stat.mtimeMs > 2 * 60 * 60 * 1000) fs.unlinkSync(fp);
-      } catch {}
-    }
-  } catch {}
-}
-
 // ===================== Behavior observation helpers =====================
 
 /**
@@ -82,7 +62,6 @@ function buildSessionBehaviorFromRecords(records) {
     dbDryRuns: 0,
     mcpTools: [],
     mcpActionCount: 0,
-    
     workflowPhases: [],
   };
 
@@ -104,9 +83,8 @@ function buildSessionBehaviorFromRecords(records) {
     if (r.type === 'mcp_action') {
       const mcpTool = r.mcpTool || r.tool;
       if (!summary.mcpTools.includes(mcpTool)) summary.mcpTools.push(mcpTool);
+      summary.mcpActionCount++;
     }
-    if (r.type === 'mcp_action') summary.mcpActionCount++;
-    if (r.type === 'mcp_action') ;
   }
 
   // Detect workflow phases from tool sequence
@@ -151,221 +129,168 @@ function detectWorkflowPhases(sequence) {
 }
 
 /**
- * Read recent session logs for cross-session pattern comparison.
+ * Read recent session logs of this project root for cross-session pattern comparison.
+ * Entries written before roots were logged match on the project's basename.
  */
-function readRecentSessionLogs(projectPath, maxSessions) {
+function readRecentSessionLogs(projectRoot, maxSessions) {
   try {
     const lines = fs.readFileSync(SESSION_LOG_PATH, 'utf8').trim().split('\n').filter(Boolean);
-    const projectName = path.basename(projectPath);
-
-    // Filter to this project's sessions, take last N
+    const projectName = path.basename(projectRoot);
     const projectSessions = [];
     for (const line of lines) {
       try {
         const entry = JSON.parse(line);
-        if (entry.project === projectName || entry.project === projectPath) {
+        if (entry.root === projectRoot || (!entry.root && entry.project === projectName)) {
           projectSessions.push(entry);
         }
       } catch {}
     }
-
     return projectSessions.slice(-(maxSessions || 10));
   } catch { return []; }
 }
 
-// ===================== Rule learning: save pending + spawn background =====================
+// ===================== Pending data + background processor =====================
 
-function savePendingAndSpawn(projectPath, tempFile, preReadRecords) {
+function spawnProcessor(pendingFile, projectRoot) {
   try {
-    const memoryReader = require(path.join(LEARNING_ROOT, 'memoryReader'));
-    const claudeMdWriter = require(path.join(LEARNING_ROOT, 'claudeMdWriter'));
-    const ruleEngine = require(path.join(LEARNING_ROOT, 'ruleEngine'));
-
-    // Determine session start time
-    let sessionStartTime;
-    if (tempFile) {
-      try { sessionStartTime = fs.statSync(tempFile).ctimeMs; }
-      catch { sessionStartTime = memoryReader.getSessionStartTime(); }
-    } else {
-      sessionStartTime = memoryReader.getSessionStartTime();
-    }
-
-    // Use pre-read records (already parsed once in main flow)
-    const observations = preReadRecords || [];
-
-    // Read new feedback memories
-    const newMemories = memoryReader.getNewFeedbackMemories(projectPath, sessionStartTime);
-
-    // Build session behavior summary from already-parsed observations
-    const sessionBehavior = buildSessionBehaviorFromRecords(observations);
-
-    // Read past session logs for cross-session pattern detection
-    const recentSessions = readRecentSessionLogs(projectPath, 10);
-
-    const hasMemories = newMemories.length > 0;
-    const hasSignificantBehavior = sessionBehavior.toolCalls >= 5;
-    const hasObservations = observations.length >= 3;
-
-    if (!hasMemories && !hasSignificantBehavior && !hasObservations) {
-      // No new memories and trivial session — just update fitness
-      const activeRules = ruleEngine.getActiveRules(projectPath);
-      if (activeRules.length > 0) {
-        ruleEngine.evaluateFitness(projectPath, [], new Set());
-        const updated = ruleEngine.getActiveRules(projectPath);
-        claudeMdWriter.writeRulesToClaudeMd(projectPath, updated);
-      }
-      return { spawned: false, reason: 'no_new_data' };
-    }
-
-    // Read hand-written content
-    const { content: claudeMdContent } = claudeMdWriter.readClaudeMd(projectPath);
-    const handWrittenContent = claudeMdWriter.getHandWrittenContent(claudeMdContent);
-
-    // Get existing active rules
-    const existingActiveRules = ruleEngine.getActiveRules(projectPath);
-
-    // Save pending data for background processor (now includes full observations)
-    const pending = {
-      project: projectPath,
-      timestamp: new Date().toISOString(),
-      newMemories,
-      observations,
-      sessionBehavior,
-      projectType: sessionBehavior.projectType || 'general',
-      recentSessions,
-      existingActiveRules,
-      handWrittenContent,
-    };
-
-    // Use session-specific pending file to avoid concurrent session clobber
-    const sessionId = Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 5);
-    const pendingFile = path.join(path.dirname(PENDING_PATH), `pending_${sessionId}.json`);
-    fs.mkdirSync(path.dirname(PENDING_PATH), { recursive: true });
-    const tmp = pendingFile + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(pending, null, 2), 'utf8');
-    fs.renameSync(tmp, pendingFile);
-
-    // Spawn background processor with the specific pending file
-    const logPath = path.join(LEARNING_ROOT, 'data', 'process.log');
-    const logFd = fs.openSync(logPath, 'a');
+    if (fs.statSync(PROCESS_LOG).size > MAX_LOG_BYTES) fs.renameSync(PROCESS_LOG, `${PROCESS_LOG}.1`);
+  } catch {}
+  const logFd = fs.openSync(PROCESS_LOG, 'a');
+  try {
     const child = spawn(process.execPath, [PROCESS_SCRIPT, pendingFile], {
       detached: true,
       stdio: ['ignore', logFd, logFd],
-      cwd: projectPath,
+      cwd: projectRoot,
+      env: { ...process.env, [CHILD_ENV]: '1' },
       windowsHide: true,
     });
     child.unref();
+    return child.pid;
+  } finally {
     fs.closeSync(logFd);
+  }
+}
 
-    return { spawned: true, memories: newMemories.length, observations: observations.length, pid: child.pid };
+/**
+ * Process one claimed observation file. Returns a short summary for session_log.jsonl.
+ */
+function processSession(claimedFile, payload) {
+  const records = sessionMemory.readObservations(claimedFile);
+  const { header, observations } = sessionMemory.splitObservations(records);
+  const sessionId = (header && header.sessionId) || payload.session_id ||
+    path.basename(claimedFile).replace(sessionMemory.OBS_PREFIX, '').replace(/\.jsonl\.processing$/, '');
+  const cwd = (header && header.cwd) || payload.cwd || process.cwd();
+  // Start time comes from the session record; without one, the first observation is the best bound
+  const sessionStartMs = (header && Number.isFinite(header.startMs)) ? header.startMs
+    : observations.length > 0 ? observations[0].ts : Date.now();
+  const { root } = resolveProjectRoot(cwd);
+  const sessionBehavior = buildSessionBehaviorFromRecords(observations);
+
+  const logEntry = { sessionId, root, tool_calls: observations.length };
+
+  if (observations.length > 0) {
+    const sessionData = aggregateSession(observations);
+    sessionData.cwd = root || cwd;
+
+    const analyzer = require(path.join(LEARNING_ROOT, 'analyzer'));
+    const analysis = analyzer.analyzeSession(sessionData);
+    try { analyzer.updateProfile(PROFILE_PATH, analysis); } catch (err) { logError('profile', err); }
+
+    Object.assign(logEntry, {
+      project: analysis.patterns.project || 'unknown',
+      signals: analysis.signals,
+      db_queries: sessionData.dbQueries.length,
+      mcp_queries: sessionData.mcpQueries.length,
+      top_tools: Object.entries(sessionData.tools)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5)
+        .map(([t, c]) => `${t}:${c}`),
+      project_type: sessionBehavior.projectType || 'general',
+    });
+  }
+
+  if (!root) return { ...logEntry, learning: 'skipped: no project root' };
+
+  const memoryReader = require(path.join(LEARNING_ROOT, 'memoryReader'));
+  const newMemories = memoryReader.getNewFeedbackMemories(cwd, sessionStartMs).map(m => ({
+    ...m, name: redact(m.name), description: redact(m.description), content: redact(m.content),
+  }));
+  logEntry.memories = newMemories.length;
+
+  // Trivial session: nothing to learn, nothing spawned
+  if (newMemories.length === 0 && sessionBehavior.toolCalls < 5 && observations.length < 3) {
+    return { ...logEntry, learning: 'skipped: trivial session' };
+  }
+
+  // Read recent sessions before this one is logged
+  const recentSessions = readRecentSessionLogs(root, 10);
+  const pendingFile = path.join(DATA_DIR, `pending_${sessionMemory.sessionKey({ session_id: sessionId })}.json`);
+  writeJsonAtomic(pendingFile, {
+    project: root,
+    cwd,
+    sessionId,
+    sessionStartMs,
+    timestamp: new Date().toISOString(),
+    newMemories,
+    observations,
+    sessionBehavior,
+    projectType: sessionBehavior.projectType || 'general',
+    recentSessions,
+  });
+  const pid = spawnProcessor(pendingFile, root);
+  return { ...logEntry, learning: `processing (pid ${pid})` };
+}
+
+function run(claimedFile, payload) {
+  try {
+    const entry = processSession(claimedFile, payload);
+    appendBounded(SESSION_LOG_PATH, JSON.stringify({ timestamp: new Date().toISOString(), ...entry }));
   } catch (err) {
-    try {
-      fs.mkdirSync(path.join(LEARNING_ROOT, 'data'), { recursive: true });
-      fs.appendFileSync(
-        path.join(LEARNING_ROOT, 'data', 'rule_errors.log'),
-        new Date().toISOString() + ' [session-end] ' + (err.stack || err.message || err) + '\n',
-        'utf8'
-      );
-    } catch {}
-    return { spawned: false, error: err.message };
+    logError('process', err);
+  } finally {
+    try { fs.unlinkSync(claimedFile); } catch {}
   }
 }
 
 // ===================== Main =====================
 
 function main() {
-  let input = '';
-  let handled = false;
+  const sweepAt = process.argv.indexOf('--sweep');
+  if (sweepAt !== -1) {
+    // Spawned by session-start for an abandoned session (already claimed). Runs even though
+    // CLAUDE_EVOLVE_CHILD is set: that guard is for hook invocations only.
+    if (process.argv[sweepAt + 1]) run(process.argv[sweepAt + 1], {});
+    return;
+  }
 
+  // Child of the processor (its own `claude` calls): nothing to record.
+  if (process.env[CHILD_ENV] === '1') return;
+
+  let input = '';
   process.stdin.setEncoding('utf8');
   process.stdin.on('data', chunk => { input += chunk; });
   process.stdin.on('end', () => {
-    if (handled) return;
-    handled = true;
-
     try {
-      // Guard: skip if this is a child process spawned by llmBrain
-      if (process.env.EVOLVER_CHILD === '1') {
-        process.stdout.write(JSON.stringify({}));
-        return;
-      }
-
-      // --- Read temp file ONCE, reuse everywhere ---
-      const tempFile = findSessionTempFile();
-      const sessionMemoryMod = require(path.join(LEARNING_ROOT, 'sessionMemory'));
-      const records = sessionMemoryMod.readObservations(tempFile);
-
-      if (records.length > 0) {
-        const sessionData = aggregateSession(records);
-        sessionData.cwd = process.cwd();
-
-        const analyzer = require(ANALYZER_PATH);
-        const analysis = analyzer.analyzeSession(sessionData);
-        analyzer.updateProfile(PROFILE_PATH, analysis);
-
-        // Classify project type for the session log
-        const sessionBehaviorForLog = buildSessionBehaviorFromRecords(records);
-
-        const logEntry = {
-          timestamp: new Date().toISOString(),
-          project: analysis.patterns.project || 'unknown',
-          tool_calls: analysis.totalToolCalls,
-          signals: analysis.signals,
-          matched_genes: (analysis.matched || []).map(m => m.gene),
-          db_queries: sessionData.dbQueries.length,
-          mcp_queries: sessionData.mcpQueries.length,
-          top_tools: Object.entries(sessionData.tools)
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, 5)
-            .map(([t, c]) => `${t}:${c}`),
-          project_type: sessionBehaviorForLog.projectType || 'general',
-        };
-
-        fs.mkdirSync(path.dirname(SESSION_LOG_PATH), { recursive: true });
-        fs.appendFileSync(SESSION_LOG_PATH, JSON.stringify(logEntry) + '\n', 'utf8');
-      }
-
-      // --- NEW: Save pending data + spawn LLM background processor ---
-      const projectPath = process.cwd();
-      const spawnResult = savePendingAndSpawn(projectPath, tempFile, records);
-
-      // Cleanup
-      cleanupTempFiles();
-      if (tempFile) {
-        try { fs.unlinkSync(tempFile); } catch {}
-      }
-
-      // Output
-      const parts = [];
-      if (records.length > 0) parts.push(`tools=${records.length}`);
-      if (spawnResult.spawned) {
-        parts.push(`learning=processing(${spawnResult.memories} memories, ${spawnResult.observations || 0} obs)`);
-      }
-
-      const msg = parts.length > 0
-        ? `[Learning] Session recorded: ${parts.join(', ')}`
-        : '';
-
-      process.stdout.write(JSON.stringify(msg ? { additionalContext: msg } : {}));
-    } catch (e) {
+      const payload = input.trim() ? JSON.parse(input) : {};
+      // Still registered as a Stop hook by an older setup.js: Stop fires every turn, and
+      // processing runs once per session. The session-start sweep covers such installs.
+      if (payload.hook_event_name && payload.hook_event_name !== 'SessionEnd') return;
+      const file = sessionMemory.observationFile(sessionMemory.sessionKey(payload));
+      const claimedFile = `${file}.processing`;
       try {
-        fs.mkdirSync(path.join(LEARNING_ROOT, 'data'), { recursive: true });
-        fs.appendFileSync(
-          path.join(LEARNING_ROOT, 'data', 'rule_errors.log'),
-          new Date().toISOString() + ' [session-end main] ' + (e.stack || e.message || e) + '\n',
-          'utf8'
-        );
-      } catch {}
-      process.stdout.write(JSON.stringify({}));
+        fs.renameSync(file, claimedFile); // whoever renames first owns the file
+      } catch (err) {
+        if (err.code !== 'ENOENT') throw err;
+        return; // no observations for this session, or a sweep already claimed them
+      }
+      run(claimedFile, payload);
+    } catch (err) {
+      logError('main', err);
     }
   });
 
-  setTimeout(() => {
-    if (handled) return;
-    handled = true;
-    process.stdout.write(JSON.stringify({}));
-    process.exit(0);
-  }, 7000);
+  // Safety net if stdin never closes. unref: it never keeps a finished hook alive.
+  setTimeout(() => process.exit(0), 7000).unref();
 }
 
 main();

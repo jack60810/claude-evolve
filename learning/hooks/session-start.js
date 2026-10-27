@@ -1,200 +1,245 @@
 #!/usr/bin/env node
 // session-start.js — SessionStart hook
-// Progressive disclosure: inject only Tier 1 (index + stats) at startup.
-// Detailed context available on-demand via MCP tools.
+// 1. Opens this session's observation file; its first record holds the session start time.
+// 2. Sweeps observation files of sessions that ended without SessionEnd (Claude process gone,
+//    or idle for 24 h): claims each by rename and processes it in a detached
+//    `session-end.js --sweep` child, so session start never waits for it.
+// 3. Progressive disclosure: injects only Tier 1 context (index + stats) for the current
+//    project root, as hookSpecificOutput.additionalContext. Prints nothing when there is
+//    nothing to say.
 
-const path = require('path');
 const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawn } = require('child_process');
 
 const LEARNING_ROOT = path.join(__dirname, '..');
+const { DATA_DIR, CHILD_ENV, resolveProjectRoot } = require(path.join(LEARNING_ROOT, 'paths'));
+const { readJson, writeJsonAtomic, withLock, appendBounded } = require(path.join(LEARNING_ROOT, 'fsutil'));
+const sessionMemory = require(path.join(LEARNING_ROOT, 'sessionMemory'));
+
+const ERROR_LOG = path.join(DATA_DIR, 'hook_errors.log');
+const HINTS_PATH = path.join(DATA_DIR, 'skill_hints.json');
+const DAY_MS = 24 * 60 * 60 * 1000;
+const MAX_SWEEP = 5; // abandoned sessions handed off per session start
+
+function logError(where, err) {
+  try { appendBounded(ERROR_LOG, `${new Date().toISOString()} [session-start ${where}] ${err && err.stack || err}`); } catch {}
+}
+
+// ===================== Sweep of abandoned sessions =====================
+
+/** Session record from the first 4 KB of an observation file (null if absent). */
+function readSessionRecord(file) {
+  const fd = fs.openSync(file, 'r');
+  try {
+    const buf = Buffer.alloc(4096);
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    for (const line of buf.toString('utf8', 0, n).split('\n')) {
+      try {
+        const rec = JSON.parse(line);
+        if (rec && rec.type === 'session') return rec;
+      } catch {}
+    }
+    return null;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function pidAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code !== 'ESRCH'; }
+}
+
+function isAbandoned(file, now) {
+  const st = fs.statSync(file);
+  if (process.getuid && st.uid !== process.getuid()) return false; // another user's session (shared /tmp)
+  if (now - st.mtimeMs > DAY_MS) return true;
+  const rec = readSessionRecord(file);
+  return !!rec && Number.isInteger(rec.pid) && rec.pid > 1 && !pidAlive(rec.pid);
+}
+
+function sweep(currentFile) {
+  const tmpDir = os.tmpdir();
+  const now = Date.now();
+  let claimed = 0;
+  for (const f of fs.readdirSync(tmpDir)) {
+    const fp = path.join(tmpDir, f);
+    try {
+      // Legacy files (keyed by ppid + date, before session_id keys) and claims that never finished
+      const stale = (f.startsWith('claude-learning-') && f.endsWith('.jsonl')) ||
+        (f.startsWith(sessionMemory.OBS_PREFIX) && f.endsWith('.jsonl.processing'));
+      if (stale) {
+        if (now - fs.statSync(fp).mtimeMs > DAY_MS) fs.unlinkSync(fp);
+        continue;
+      }
+      if (!f.startsWith(sessionMemory.OBS_PREFIX) || !f.endsWith('.jsonl')) continue;
+      if (fp === currentFile || claimed >= MAX_SWEEP || !isAbandoned(fp, now)) continue;
+
+      const claimedFile = `${fp}.processing`;
+      fs.renameSync(fp, claimedFile); // whoever renames first owns the file
+      fs.utimesSync(claimedFile, new Date(), new Date()); // fresh claim: not "stale" to others
+      claimed++;
+      spawn(process.execPath, [path.join(__dirname, 'session-end.js'), '--sweep', claimedFile], {
+        detached: true,
+        stdio: 'ignore',
+        env: { ...process.env, [CHILD_ENV]: '1' },
+        windowsHide: true,
+      }).unref();
+    } catch (err) {
+      if (err.code !== 'ENOENT') logError('sweep', err);
+    }
+  }
+}
+
+// ===================== Context sections =====================
+
+function readJsonLines(file) {
+  try {
+    return fs.readFileSync(file, 'utf8').trim().split('\n').filter(Boolean)
+      .map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  } catch { return []; }
+}
+
+function buildContext(root) {
+  const sections = [];
+  let shownHints = [];
+  let ruleEngine = null;
+  let activeRules = [];
+
+  // --- Tier 1: Session memory index (recent history of this project) ---
+  try {
+    const indexLines = sessionMemory.readIndex(10, root);
+    if (indexLines.length > 0) {
+      sections.push('[Recent Sessions]');
+      sections.push(indexLines.join('\n'));
+    }
+  } catch (err) { logError('index', err); }
+
+  // --- Compact rule stats ---
+  try {
+    ruleEngine = require(path.join(LEARNING_ROOT, 'ruleEngine'));
+    activeRules = ruleEngine.getActiveRules(root);
+    if (activeRules.length > 0) {
+      sections.push(`[claude-evolve] ${activeRules.length} active rules (see the auto-learned section of ${require(path.join(LEARNING_ROOT, 'claudeMdWriter')).RULES_FILENAME})`);
+    }
+  } catch (err) { logError('rules', err); }
+
+  // --- Skill maturity hints (marked shown only after they are printed) ---
+  try {
+    const hints = readJson(HINTS_PATH, { hints: [] });
+    shownHints = (hints.hints || []).filter(h => !h.shown);
+    if (shownHints.length > 0) {
+      sections.push('[claude-evolve] Skill Update');
+      for (const hint of shownHints) sections.push(`  ${hint.message}`);
+    }
+  } catch (err) { logError('hints', err); }
+
+  // --- Cross-project pattern suggestions (informational) ---
+  try {
+    const xpStore = readJson(path.join(DATA_DIR, 'cross_project_patterns.json'), { patterns: [] });
+    const patterns = xpStore.patterns || [];
+    if (patterns.length > 0 && ruleEngine) {
+      // Project type from the most recent session log entry of this project
+      const projectName = path.basename(root);
+      let currentProjectType = 'general';
+      const logEntries = readJsonLines(path.join(DATA_DIR, 'session_log.jsonl')).slice(-200).reverse();
+      const own = logEntries.find(e => (e.root === root || (!e.root && e.project === projectName)) && e.project_type);
+      if (own) currentProjectType = own.project_type;
+
+      const suggestions = patterns.filter(xp =>
+        xp.project_type === currentProjectType &&
+        xp.source_project !== root &&
+        !activeRules.some(r => ruleEngine.jaccardSimilarity(r.keywords || [], xp.keywords || []) > 0.5)
+      );
+      if (suggestions.length > 0) {
+        sections.push(`[claude-evolve] Patterns learned in other ${currentProjectType} projects (informational):`);
+        for (const s of suggestions.slice(0, 3)) {
+          sections.push(`  From ${path.basename(s.source_project || '')}: "${(s.content || '').slice(0, 100)}"`);
+        }
+      }
+    }
+  } catch (err) { logError('cross-project', err); }
+
+  // --- Recent rule changes of this project (compact, last 24h) ---
+  try {
+    const entries = readJsonLines(path.join(DATA_DIR, 'changelog.jsonl'));
+    const oneDayAgo = Date.now() - DAY_MS;
+    const recent = [];
+    for (let i = entries.length - 1; i >= 0 && recent.length < 10; i--) {
+      const entry = entries[i];
+      if (new Date(entry.timestamp).getTime() < oneDayAgo) break;
+      if (entry.project !== root) continue;
+      if (['add_rule', 'born', 'prune_rule', 'dead', 'distill_rules'].includes(entry.action)) recent.push(entry);
+    }
+
+    if (recent.length > 0) {
+      sections.push('[Rule Changes (24h)]');
+      for (const r of recent.reverse()) {
+        if (r.action === 'add_rule' || r.action === 'born') {
+          const src = r.source === 'observation' ? 'obs' : r.source === 'anti_pattern' ? 'fix' : r.source === 'behavior' ? 'beh' : 'corr';
+          sections.push(`+ [${src}] ${(r.content || '').slice(0, 80)}`);
+        } else if (r.action === 'prune_rule' || r.action === 'dead') {
+          sections.push(`- pruned: ${(r.content || '').slice(0, 60)}`);
+        } else if (r.action === 'distill_rules') {
+          sections.push(`~ distilled ${(r.distilled_from || []).length} → 1`);
+        }
+      }
+    }
+  } catch (err) { logError('changelog', err); }
+
+  return { sections, shownHints };
+}
+
+function markHintsShown(shown) {
+  const key = h => h.pattern_id || h.message;
+  const ids = new Set(shown.map(key));
+  withLock(HINTS_PATH, () => {
+    const hints = readJson(HINTS_PATH, { hints: [] });
+    for (const h of hints.hints || []) if (ids.has(key(h))) h.shown = true;
+    writeJsonAtomic(HINTS_PATH, hints);
+  });
+}
+
+// ===================== Main =====================
+
+function handle(input) {
+  const data = input.trim() ? JSON.parse(input) : {};
+  const cwd = data.cwd || process.cwd();
+  const currentFile = sessionMemory.observationFile(sessionMemory.sessionKey(data));
+
+  try { sessionMemory.startObservationFile(currentFile, data.session_id || null, cwd); }
+  catch (err) { logError('observation-file', err); }
+  try { sweep(currentFile); } catch (err) { logError('sweep', err); }
+
+  const { root } = resolveProjectRoot(cwd);
+  if (!root) return; // no project root: no rules, no project history
+
+  const { sections, shownHints } = buildContext(root);
+  if (sections.length === 0) return;
+
+  const out = JSON.stringify({
+    hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: sections.join('\n') },
+  });
+  process.stdout.write(out, err => {
+    if (err || shownHints.length === 0) return;
+    try { markHintsShown(shownHints); } catch (e) { logError('hints-mark', e); }
+  });
+}
 
 function main() {
-  let input = '';
-  let handled = false;
+  // Child of the processor (its own `claude` calls): nothing to inject or sweep.
+  if (process.env[CHILD_ENV] === '1') return;
 
+  let input = '';
   process.stdin.setEncoding('utf8');
   process.stdin.on('data', chunk => { input += chunk; });
   process.stdin.on('end', () => {
-    if (handled) return;
-    handled = true;
-
-    try {
-      // Guard: skip if this is a child process spawned by llmBrain
-      if (process.env.EVOLVER_CHILD === '1') {
-        process.stdout.write(JSON.stringify({}));
-        return;
-      }
-
-      const sections = [];
-
-      // --- Tier 1: Session memory index (recent history) ---
-      try {
-        const sessionMemory = require(path.join(LEARNING_ROOT, 'sessionMemory'));
-        const indexLines = sessionMemory.readIndex(10);
-        if (indexLines.length > 0) {
-          sections.push('[Recent Sessions]');
-          sections.push(indexLines.join('\n'));
-        }
-      } catch {}
-
-      // --- Compact rule stats ---
-      try {
-        const ruleEngine = require(path.join(LEARNING_ROOT, 'ruleEngine'));
-        const projectPath = process.cwd();
-        const activeRules = ruleEngine.getActiveRules(projectPath);
-        if (activeRules.length > 0) {
-          sections.push(`[claude-evolve] ${activeRules.length} active rules (see CLAUDE.md auto-learned section)`);
-        }
-      } catch {}
-
-      // --- Conflict alerts (must be immediate — user action required) ---
-      try {
-        const ruleEngine = require(path.join(LEARNING_ROOT, 'ruleEngine'));
-        const projectPath = process.cwd();
-        const conflicts = ruleEngine.getPendingConflicts(projectPath);
-
-        if (conflicts.length > 0) {
-          sections.push('⚠️ [claude-evolve Conflict Alert]');
-          sections.push('The following auto-learned rules conflict with hand-written CLAUDE.md:');
-          for (const c of conflicts) {
-            sections.push(`- New rule: "${c.new_content}"`);
-            sections.push(`  Conflicts with: "${(c.conflicts_with || '').slice(0, 150)}..." (ID: ${c.id})`);
-          }
-          sections.push('Reply "accept new rule" / "keep existing" / "update existing" to resolve');
-        }
-      } catch {}
-
-      // --- Skill maturity hints ---
-      try {
-        const hintsPath = path.join(LEARNING_ROOT, 'data', 'skill_hints.json');
-        if (fs.existsSync(hintsPath)) {
-          const hints = JSON.parse(fs.readFileSync(hintsPath, 'utf8'));
-          const unshown = (hints.hints || []).filter(h => !h.shown);
-
-          if (unshown.length > 0) {
-            sections.push('[claude-evolve] Skill Update');
-            for (const hint of unshown) {
-              sections.push(`  ${hint.message}`);
-            }
-
-            // Mark as shown
-            for (const hint of unshown) {
-              hint.shown = true;
-            }
-            const tmp = hintsPath + '.tmp';
-            fs.writeFileSync(tmp, JSON.stringify(hints, null, 2) + '\n', 'utf8');
-            fs.renameSync(tmp, hintsPath);
-          }
-        }
-      } catch {}
-
-      // --- Cross-project pattern suggestions ---
-      try {
-        const xpPath = path.join(LEARNING_ROOT, 'data', 'cross_project_patterns.json');
-        if (fs.existsSync(xpPath)) {
-          const xpStore = JSON.parse(fs.readFileSync(xpPath, 'utf8'));
-          const patterns = xpStore.patterns || [];
-
-          if (patterns.length > 0) {
-            const projectPath = process.cwd();
-            const projectName = path.basename(projectPath);
-
-            // Get project type from most recent session log entry
-            const sessionLogPath = path.join(LEARNING_ROOT, 'data', 'session_log.jsonl');
-            let currentProjectType = 'general';
-            if (fs.existsSync(sessionLogPath)) {
-              const logLines = fs.readFileSync(sessionLogPath, 'utf8').trim().split('\n').filter(Boolean);
-              for (let i = logLines.length - 1; i >= Math.max(0, logLines.length - 20); i--) {
-                try {
-                  const entry = JSON.parse(logLines[i]);
-                  if (entry.project === projectName && entry.project_type) {
-                    currentProjectType = entry.project_type;
-                    break;
-                  }
-                } catch {}
-              }
-            }
-
-            // Find patterns matching this project type that don't exist locally
-            const ruleEngine = require(path.join(LEARNING_ROOT, 'ruleEngine'));
-            const activeRules = ruleEngine.getActiveRules(projectPath);
-
-            const suggestions = [];
-            for (const xp of patterns) {
-              if (xp.project_type !== currentProjectType) continue;
-              if (xp.source_project === projectPath) continue;
-              const alreadyExists = activeRules.some(r =>
-                ruleEngine.jaccardSimilarity(r.keywords || [], xp.keywords || []) > 0.5
-              );
-              if (alreadyExists) continue;
-              suggestions.push(xp);
-            }
-
-            if (suggestions.length > 0) {
-              sections.push(`[claude-evolve] Cross-project patterns available (${currentProjectType})`);
-              for (const s of suggestions.slice(0, 3)) {
-                sections.push(`  From ${path.basename(s.source_project)}: "${s.content.slice(0, 100)}"`);
-              }
-              sections.push('  Reply "apply cross-project patterns" to add them to this project');
-            }
-          }
-        }
-      } catch {}
-
-      // --- Recent rule changes (compact, last 24h) ---
-      try {
-        const changelogPath = path.join(LEARNING_ROOT, 'data', 'changelog.jsonl');
-        if (fs.existsSync(changelogPath)) {
-          const lines = fs.readFileSync(changelogPath, 'utf8').trim().split('\n').filter(Boolean);
-          const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
-          const recent = [];
-          for (let i = lines.length - 1; i >= Math.max(0, lines.length - 10); i--) {
-            try {
-              const entry = JSON.parse(lines[i]);
-              if (new Date(entry.timestamp).getTime() < oneDayAgo) break;
-              if (['add_rule', 'prune_rule', 'distill_rules'].includes(entry.action)) {
-                recent.push(entry);
-              }
-            } catch {}
-          }
-
-          if (recent.length > 0) {
-            sections.push('[Rule Changes (24h)]');
-            for (const r of recent.reverse()) {
-              if (r.action === 'add_rule') {
-                const src = r.source === 'observation' ? 'obs' : r.source === 'anti_pattern' ? 'fix' : r.source === 'behavior' ? 'beh' : 'corr';
-                sections.push(`+ [${src}] ${(r.content || '').slice(0, 80)}`);
-              } else if (r.action === 'prune_rule') {
-                sections.push(`- pruned: ${(r.content || '').slice(0, 60)}`);
-              } else if (r.action === 'distill_rules') {
-                sections.push(`~ distilled ${(r.distilled_from || []).length} → 1`);
-              }
-            }
-          }
-        }
-      } catch {}
-
-      if (sections.length === 0) {
-        process.stdout.write(JSON.stringify({}));
-        return;
-      }
-
-      const context = sections.join('\n');
-      process.stdout.write(JSON.stringify({
-        agent_message: context,
-        additionalContext: context,
-      }));
-    } catch {
-      process.stdout.write(JSON.stringify({}));
-    }
+    try { handle(input); } catch (err) { logError('main', err); }
   });
 
-  setTimeout(() => {
-    if (handled) return;
-    handled = true;
-    process.stdout.write(JSON.stringify({}));
-    process.exit(0);
-  }, 2000);
+  // Safety net if stdin never closes. unref: it never keeps a finished hook alive.
+  setTimeout(() => process.exit(0), 2000).unref();
 }
 
 main();

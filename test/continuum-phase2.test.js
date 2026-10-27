@@ -8,6 +8,10 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
+// Isolate every data write (rules.json, changelog, caches) from learning/data
+process.env.CLAUDE_EVOLVE_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ce-data-'));
+const DATA_DIR = process.env.CLAUDE_EVOLVE_DATA_DIR;
+
 // =====================================================================
 // Helpers
 // =====================================================================
@@ -99,17 +103,8 @@ describe('triage skillify gene', () => {
     // The fallback is in processRules.js, not in llmBrain.triage.
     // So we test the fallback logic from processRules by importing it indirectly.
 
-    // Since fallbackTriage is a local function in processRules.js, we replicate its logic:
-    function fallbackTriage(newMemories, observations, activeRuleCount, sessionCount, highScoreGroups) {
-      let gene = 'observe';
-      if ((newMemories || []).length > 0) gene = 'repair';
-      else if ((observations || []).length >= 3 && activeRuleCount === 0) gene = 'repair';
-      else if ((observations || []).length >= 5) gene = 'innovate';
-      else if ((highScoreGroups || 0) > 0) gene = 'skillify';
-      else if (activeRuleCount >= 8) gene = 'cleanup';
-      else if (sessionCount > 0 && sessionCount % 3 === 0) gene = 'optimize';
-      return { gene, complexity: 'routine', reason: 'fallback heuristic' };
-    }
+    // fallbackTriage is exported by processRules.js (requiring it does not run the processor)
+    const { fallbackTriage } = require('../learning/processRules');
 
     const fb = fallbackTriage([], [{ tool: 'Read', input: 'a' }], 4, 7, 1);
     assert.equal(fb.gene, 'skillify', 'Fallback should select skillify when highScoreGroups > 0');
@@ -166,7 +161,7 @@ describe('ruleEngine.getRelatedRules', () => {
     delete require.cache[ruleEnginePath];
     ruleEngine = require('../learning/ruleEngine');
 
-    dataDir = path.join(__dirname, '..', 'learning', 'data');
+    dataDir = DATA_DIR;
     rulesFile = path.join(dataDir, 'rules.json');
     changelogFile = path.join(dataDir, 'changelog.jsonl');
 
@@ -273,7 +268,7 @@ describe('ruleEngine lifecycle demotion', () => {
     delete require.cache[ruleEnginePath];
     ruleEngine = require('../learning/ruleEngine');
 
-    dataDir = path.join(__dirname, '..', 'learning', 'data');
+    dataDir = DATA_DIR;
     rulesFile = path.join(dataDir, 'rules.json');
     changelogFile = path.join(dataDir, 'changelog.jsonl');
 

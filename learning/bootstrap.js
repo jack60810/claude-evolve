@@ -10,22 +10,12 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { createEmptyProfile } = require('./analyzer');
+const { parseFrontmatter } = require('./memoryReader');
+const { DATA_DIR } = require('./paths');
+const { writeJsonAtomic } = require('./fsutil');
 
-const PROFILE_PATH = path.join(__dirname, 'data', 'user_profile.json');
+const PROFILE_PATH = path.join(DATA_DIR, 'user_profile.json');
 const PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
-
-function parseFrontmatter(content) {
-  const match = content.match(/^---\n([\s\S]*?)\n---/);
-  if (!match) return {};
-  const result = {};
-  for (const line of match[1].split('\n')) {
-    const colonIdx = line.indexOf(':');
-    if (colonIdx > 0) {
-      result[line.slice(0, colonIdx).trim()] = line.slice(colonIdx + 1).trim();
-    }
-  }
-  return result;
-}
 
 function scanMemoryFiles() {
   const memories = [];
@@ -43,7 +33,7 @@ function scanMemoryFiles() {
             type: fm.type || 'unknown',
             name: fm.name || f,
             description: fm.description || '',
-            body: raw.replace(/^---[\s\S]*?---\n*/, '').trim(),
+            body: fm.body || '',
           });
         } catch {}
       }
@@ -73,9 +63,12 @@ function bootstrap() {
   // Set defaults
   profile.session_count = 0;
 
-  // Write profile
-  fs.mkdirSync(path.dirname(PROFILE_PATH), { recursive: true });
-  fs.writeFileSync(PROFILE_PATH, JSON.stringify(profile, null, 2) + '\n', 'utf8');
+  // Write profile only when there is none yet: never reset accumulated sessions
+  if (fs.existsSync(PROFILE_PATH)) {
+    console.log(`\nProfile already exists, left unchanged: ${PROFILE_PATH}`);
+    return;
+  }
+  writeJsonAtomic(PROFILE_PATH, profile);
 
   console.log(`\nProfile initialized at: ${PROFILE_PATH}`);
   console.log(`Sessions will build on this profile automatically.`);

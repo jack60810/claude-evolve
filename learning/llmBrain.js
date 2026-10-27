@@ -2,8 +2,18 @@
 // llmBrain.js — LLM-powered decision engine for rule learning
 // Uses `claude --print` to make semantic decisions instead of hardcoded thresholds.
 // All functions return structured JSON from the LLM.
+//
+// Every child runs isolated: env CLAUDE_EVOLVE_CHILD=1 (our hooks exit at once), an empty
+// temp cwd (no project CLAUDE.md), and when the CLI supports it --safe-mode (no CLAUDE.md,
+// skills, plugins, hooks or MCP servers) plus --tools "" (no tools). Support is detected
+// once from `claude --help` and cached in DATA_DIR per `claude --version`.
+// Every logical call is counted; getStats() reports calls and failures for the run log.
 
-const { execSync } = require('child_process');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { DATA_DIR, CHILD_ENV } = require('./paths');
+const { appendBounded, writeJsonAtomic, readJson } = require('./fsutil');
 
 // Model tiers: haiku for simple tasks, sonnet for complex reasoning
 const MODELS = {
@@ -11,91 +21,150 @@ const MODELS = {
   smart: 'sonnet', // Reflection, distillation, complex analysis
 };
 const SYSTEM_PROMPT = 'You are a JSON classification engine for a rule learning system. Output ONLY raw JSON — no markdown fences, no code blocks, no backticks, no explanation. Just the JSON object.';
+const SKILL_SYSTEM_PROMPT = 'You write Claude Code skill files. Output ONLY the raw markdown file content, starting with --- (YAML frontmatter). No explanation, no code fences around the whole file.';
+const FALLBACK_BIN_DIRS = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/snap/bin'];
+const CAPS_PATH = path.join(DATA_DIR, 'claude_cli_caps.json');
+const LLM_ERRORS_LOG = path.join(DATA_DIR, 'llm_errors.log');
+
+function childPath() {
+  // PATH first, so a `claude` earlier on PATH (a wrapper or a test stub) wins
+  return [process.env.PATH, ...FALLBACK_BIN_DIRS, process.env.HOME ? process.env.HOME + '/.npm-global/bin' : '']
+    .filter(Boolean).join(':');
+}
 
 // Cache claude path — works on macOS (homebrew ARM/Intel), Linux, and custom installs
 let _claudePath = null;
 function getClaudePath() {
   if (_claudePath) return _claudePath;
-  const searchPaths = '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin:'
-    + (process.env.HOME ? process.env.HOME + '/.npm-global/bin:' : '')
-    + (process.env.PATH || '');
-  try {
-    _claudePath = execSync('which claude', { encoding: 'utf8', timeout: 3000,
-      env: { ...process.env, PATH: searchPaths }
-    }).trim();
-  } catch {
-    // Fallback: try common locations directly
-    const fs = require('fs');
-    const candidates = [
-      '/opt/homebrew/bin/claude',     // macOS ARM
-      '/usr/local/bin/claude',        // macOS Intel / Linux
-      '/usr/bin/claude',              // Linux system
-      '/snap/bin/claude',             // Linux snap
-    ];
-    _claudePath = candidates.find(p => { try { return fs.existsSync(p); } catch { return false; } }) || 'claude';
+  for (const dir of childPath().split(':')) {
+    const candidate = path.join(dir, 'claude');
+    try { fs.accessSync(candidate, fs.constants.X_OK); _claudePath = candidate; return _claudePath; } catch {}
   }
+  _claudePath = 'claude';
   return _claudePath;
 }
 
+function childEnv() {
+  return { ...process.env, PATH: childPath(), [CHILD_ENV]: '1', EVOLVER_CHILD: '1' };
+}
+
+// Empty working directory for children: no project CLAUDE.md or settings get picked up
+let _childCwd = null;
+function childCwd() {
+  if (_childCwd && fs.existsSync(_childCwd)) return _childCwd;
+  _childCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-evolve-llm-'));
+  const dir = _childCwd;
+  process.once('exit', () => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch {} });
+  return _childCwd;
+}
+
+function logLlmError(msg) {
+  try { appendBounded(LLM_ERRORS_LOG, `[${new Date().toISOString()}] ${msg}`, 512 * 1024); } catch {}
+}
+
 /**
- * Call Claude CLI and return parsed JSON response.
+ * Which isolation flags this CLI supports. Detected from `claude --help`, cached per version.
+ * @returns {{ safeMode: boolean, tools: boolean }}
+ */
+let _caps = null;
+function getCliCaps() {
+  if (_caps) return _caps;
+  const { spawnSync } = require('child_process');
+  const run = args => spawnSync(getClaudePath(), args, {
+    encoding: 'utf8', timeout: 15000, cwd: childCwd(), env: childEnv(), windowsHide: true,
+  });
+  const none = { safeMode: false, tools: false };
+  try {
+    const v = run(['--version']);
+    const version = (v && !v.error && v.status === 0 && (v.stdout || '').trim()) || null;
+    if (!version) { _caps = none; return _caps; }
+    let cached = null;
+    try { cached = readJson(CAPS_PATH, null); } catch {}
+    if (cached && cached.version === version) {
+      _caps = { safeMode: !!cached.safeMode, tools: !!cached.tools };
+      return _caps;
+    }
+    const h = run(['--help']);
+    const help = (h && !h.error && h.stdout) || '';
+    _caps = { safeMode: /--safe-mode\b/.test(help), tools: /--tools\b/.test(help) };
+    if (help) { try { writeJsonAtomic(CAPS_PATH, { version, ..._caps, detected_at: new Date().toISOString() }); } catch {} }
+  } catch {
+    _caps = none;
+  }
+  return _caps;
+}
+
+function cliArgs(model, systemPrompt) {
+  const caps = getCliCaps();
+  const args = [
+    '--print',
+    '--model', model,
+    '--system-prompt', systemPrompt || SYSTEM_PROMPT,
+    '--no-session-persistence',
+    '--max-turns', '1',
+  ];
+  if (caps.safeMode) args.push('--safe-mode');
+  else args.push('--strict-mcp-config');
+  if (caps.tools) args.push('--tools', '');
+  else args.push('--allowedTools', '');
+  return args;
+}
+
+// Per-run accounting: one "call" is one logical request (retries included)
+let _stats = { calls: 0, failures: 0, kinds: {} };
+function resetStats() { _stats = { calls: 0, failures: 0, kinds: {} }; }
+function getStats() { return { calls: _stats.calls, failures: _stats.failures, kinds: { ..._stats.kinds } }; }
+function recordFailure(kind) {
+  _stats.failures++;
+  _stats.kinds[kind] = (_stats.kinds[kind] || 0) + 1;
+}
+
+/**
+ * Call Claude CLI once and return parsed JSON ({ raw } when the reply is not JSON).
+ * Returns null on failure; the failure kind is stored in askClaude.lastError.
  * @param {string} prompt - The prompt text
  * @param {number} timeoutMs - Timeout in ms
  * @param {string} tier - 'fast' (haiku) or 'smart' (sonnet)
+ * @param {object} [opts] - { system: alternate system prompt }
  */
-function askClaude(prompt, timeoutMs, tier) {
+function askClaude(prompt, timeoutMs, tier, opts) {
   const timeout = timeoutMs || 30000;
   const model = MODELS[tier || 'fast'] || MODELS.fast;
+  askClaude.lastError = null;
 
   try {
     const { spawnSync } = require('child_process');
-    const result = spawnSync(getClaudePath(), [
-      '--print',
-      '--model', model,
-      '--system-prompt', SYSTEM_PROMPT,
-      '--allowedTools', '',
-      '--no-session-persistence',
-      '--max-turns', '1',
-    ], {
+    const result = spawnSync(getClaudePath(), cliArgs(model, opts && opts.system), {
       input: prompt,
       encoding: 'utf8',
       timeout,
+      cwd: childCwd(),
       windowsHide: true,
-      env: {
-        ...process.env,
-        PATH: '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:' + (process.env.PATH || ''),
-        EVOLVER_CHILD: '1',
-      },
+      env: childEnv(),
     });
 
-    if (result.error) throw result.error;
+    if (result.error) {
+      askClaude.lastError = /ETIMEDOUT|TIMEOUT/i.test(String(result.error.code || result.error.message)) ? 'timeout' : 'spawn';
+      throw result.error;
+    }
     if (result.status !== 0 && !result.stdout) {
+      askClaude.lastError = 'exit';
       const stderr = (result.stderr || '').slice(0, 200);
       throw new Error(`claude exited with status ${result.status}: ${stderr}`);
     }
-    const stdout = result.stdout || '';
-
-    // Try to parse as JSON
-    const trimmed = stdout.trim();
-    if (!trimmed) return null;
+    const trimmed = (result.stdout || '').trim();
+    if (!trimmed) { askClaude.lastError = 'empty'; return null; }
+    if (opts && opts.expectJson === false) return { raw: trimmed };
 
     // Extract JSON from potential markdown code blocks
     const jsonMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/) || [null, trimmed];
-    const jsonStr = jsonMatch[1].trim();
-
     try {
-      return JSON.parse(jsonStr);
+      return JSON.parse(jsonMatch[1].trim());
     } catch {
       return { raw: trimmed };
     }
   } catch (err) {
-    // Log error for debugging
-    try {
-      const fs = require('fs');
-      const logPath = require('path').join(__dirname, 'data', 'llm_errors.log');
-      fs.appendFileSync(logPath,
-        `[${new Date().toISOString()}] ${err.message || err}\n`, 'utf8');
-    } catch {}
+    logLlmError(`${askClaude.lastError || 'error'}: ${err.message || err}`);
     return null;
   }
 }
@@ -104,17 +173,25 @@ function askClaude(prompt, timeoutMs, tier) {
 const MIN_TIMEOUT = { fast: 30000, smart: 45000 };
 
 /**
- * Call askClaude with retry and exponential backoff.
+ * Call askClaude with retry and exponential backoff; counts one logical call.
  * Enforces minimum timeout per tier to account for CLI startup overhead.
+ * opts.expectJson (default true): a non-JSON reply counts as a 'bad_json' failure.
  */
-function askClaudeWithRetry(prompt, timeoutMs, tier, retries) {
+function askClaudeWithRetry(prompt, timeoutMs, tier, retries, opts) {
   const effectiveTier = tier || 'fast';
   const effectiveTimeout = Math.max(timeoutMs || 30000, MIN_TIMEOUT[effectiveTier] || 30000);
   const maxRetries = retries || 1;
+  const expectJson = !opts || opts.expectJson !== false;
+  _stats.calls++;
 
+  let lastKind = 'error';
   for (let i = 0; i <= maxRetries; i++) {
-    const result = askClaude(prompt, effectiveTimeout, effectiveTier);
-    if (result !== null) return result;
+    const result = askClaude(prompt, effectiveTimeout, effectiveTier, opts);
+    if (result !== null) {
+      if (expectJson && result.raw !== undefined) recordFailure('bad_json');
+      return result;
+    }
+    lastKind = askClaude.lastError || 'error';
     if (i < maxRetries) {
       // Exponential backoff: 3s, 6s, 12s...
       const backoff = 3000 * Math.pow(2, i);
@@ -122,6 +199,7 @@ function askClaudeWithRetry(prompt, timeoutMs, tier, retries) {
       spawnSync('sleep', [String(backoff / 1000)], { timeout: backoff + 2000 });
     }
   }
+  recordFailure(lastKind);
   return null;
 }
 
@@ -131,7 +209,8 @@ function askClaudeWithRetry(prompt, timeoutMs, tier, retries) {
  * Extract a concise, actionable rule from a feedback memory.
  * Returns: { rule: string, type: 'rule' | 'skill', keywords: string[] }
  */
-function extractRule(memory) {
+function extractRule(memory, tier) {
+
   const prompt = `You are a rule extraction engine. Given a feedback memory from a user's Claude Code session, extract ONE concise, actionable rule.
 
 FEEDBACK MEMORY:
@@ -146,72 +225,66 @@ Reply with ONLY this JSON (no markdown, no explanation):
   "keywords": ["<3-6 key domain terms for matching>"]
 }`;
 
-  return askClaudeWithRetry(prompt, 20000);
+  return askClaudeWithRetry(prompt, 20000, tier || 'fast');
 }
 
 /**
- * Check if a new rule conflicts with or duplicates existing hand-written CLAUDE.md rules.
- * Returns: { decision: 'new' | 'conflict' | 'duplicate', reason: string, conflicts_with?: string }
+ * Fit text blocks into a total character budget. Each layer gets an equal share; budget a
+ * short layer does not use goes to the others. A cut layer says so, instead of losing its tail silently.
+ * @param {Array<{label: string, text: string}>} layers
  */
-function checkConflict(newRule, handWrittenContent) {
-  const prompt = `You are a conflict detector. Compare a NEW auto-learned rule against EXISTING hand-written rules in CLAUDE.md.
-
-NEW RULE:
-${newRule}
-
-EXISTING HAND-WRITTEN RULES:
-${handWrittenContent.slice(0, 3000)}
-
-Decide:
-- "duplicate" if the new rule says essentially the same thing as an existing rule (even in a different language)
-- "conflict" if the new rule contradicts an existing rule
-- "new" if the new rule covers a genuinely different topic
-
-Reply with ONLY this JSON (no markdown, no explanation):
-{
-  "decision": "new|conflict|duplicate",
-  "reason": "<one sentence explaining why>",
-  "conflicts_with": "<the specific existing rule text it conflicts/duplicates with, or empty string>"
-}`;
-
-  return askClaudeWithRetry(prompt, 20000);
+function budgetLayers(layers, totalBudget) {
+  const items = (layers || []).filter(l => l && l.text && l.text.trim());
+  let remaining = totalBudget || 12000;
+  const out = new Array(items.length);
+  const order = items.map((l, i) => i).sort((x, y) => items[x].text.length - items[y].text.length);
+  order.forEach((idx, k) => {
+    const share = Math.floor(remaining / (order.length - k));
+    const text = items[idx].text.trim();
+    const shown = text.length <= share ? text
+      : text.slice(0, Math.max(0, share - 80)) + `\n[... ${text.length - Math.max(0, share - 80)} more chars of this layer not shown]`;
+    remaining -= Math.min(text.length, share);
+    out[idx] = `### ${items[idx].label}\n${shown}`;
+  });
+  return out.join('\n\n');
 }
 
 /**
- * Batch conflict check: check multiple rules at once against hand-written CLAUDE.md.
- * Returns: { results: [{ rule: string, decision: 'new'|'conflict'|'duplicate', reason: string, conflicts_with: string }] }
+ * Contradiction check: compare candidate rules with every instruction layer Claude Code loads
+ * for the project (hand-written CLAUDE.md files up the tree, ~/.claude/CLAUDE.md) and the
+ * user's memories. Those always win.
+ * @param {string[]} newRules - candidate rule texts
+ * @param {Array<{label, text}>} layers - instruction layers
+ * Returns: { results: [{ index, decision: 'new'|'duplicate'|'conflict', reason, conflicts_with, layer }] } or null
  */
-function checkConflictBatch(newRules, handWrittenContent) {
+function checkContradictions(newRules, layers, tier) {
   if (!newRules || newRules.length === 0) return { results: [] };
-  // Single rule: use existing single check
-  if (newRules.length === 1) {
-    const result = checkConflict(newRules[0], handWrittenContent);
-    return { results: [{ index: 0, rule: newRules[0], ...(result || { decision: 'new', reason: 'check failed' }) }] };
-  }
+  const layerText = budgetLayers(layers, 12000);
+  if (!layerText) return { results: newRules.map((r, i) => ({ index: i, decision: 'new', reason: 'no instructions loaded' })) };
 
-  const rulesDesc = newRules.map((r, i) => `[${i}] ${r}`).join('\n');
+  const rulesDesc = newRules.map((r, i) => `[${i}] ${String(r).slice(0, 600)}`).join('\n');
 
-  const prompt = `You are a conflict detector. Compare each NEW rule against EXISTING hand-written rules in CLAUDE.md.
+  const prompt = `You are a conflict detector. Compare each NEW auto-learned rule against the user's EXISTING instructions and memories. The existing instructions always win.
 
 NEW RULES:
-${rulesDesc.slice(0, 4000)}
+${rulesDesc}
 
-EXISTING HAND-WRITTEN RULES:
-${(handWrittenContent || '').slice(0, 3000)}
+EXISTING INSTRUCTIONS AND MEMORIES (each layer labeled):
+${layerText}
 
 For each new rule, decide:
-- "duplicate" if it says essentially the same thing as an existing rule (even in a different language)
-- "conflict" if it contradicts an existing rule
-- "new" if it covers a genuinely different topic
+- "conflict" if following it would go against any existing instruction or memory (including asks for things the user said not to do, or for a project the instruction excludes)
+- "duplicate" if an existing instruction or memory already says essentially the same thing (even in another language), or if an EARLIER rule in the NEW RULES list already covers it (set conflicts_with to "[<index>]")
+- "new" otherwise
 
 Reply with ONLY this JSON (no markdown, no explanation):
 {
   "results": [
-    {"index": 0, "decision": "new|conflict|duplicate", "reason": "<one sentence>", "conflicts_with": "<existing rule text or empty>"}
+    {"index": 0, "decision": "new|conflict|duplicate", "reason": "<one sentence>", "conflicts_with": "<the existing text, or empty>", "layer": "<layer label, or empty>"}
   ]
 }`;
 
-  return askClaudeWithRetry(prompt, 30000, 'fast');
+  return askClaudeWithRetry(prompt, 30000, tier || 'fast');
 }
 
 /**
@@ -286,30 +359,6 @@ Reply with ONLY this JSON (no markdown, no explanation):
 If no merge is warranted, reply: {"should_distill": false, "groups": []}`;
 
   return askClaudeWithRetry(prompt, 30000, 'smart');
-}
-
-/**
- * Check if a pending conflict should be auto-resolved.
- * Used when the user hasn't explicitly resolved a conflict after N sessions.
- */
-function suggestConflictResolution(conflict, handWrittenContent) {
-  const prompt = `A conflict was detected between an auto-learned rule and existing hand-written rules.
-
-AUTO-LEARNED RULE: ${conflict.new_content}
-HAND-WRITTEN RULE IT CONFLICTS WITH: ${conflict.conflicts_with}
-
-FULL HAND-WRITTEN CLAUDE.MD:
-${handWrittenContent.slice(0, 2000)}
-
-What should the user do?
-Reply with ONLY this JSON:
-{
-  "suggestion": "keep_existing|update_handwritten|accept_both",
-  "reason": "<one sentence>",
-  "proposed_update": "<if update_handwritten, what should the hand-written rule say instead; empty otherwise>"
-}`;
-
-  return askClaudeWithRetry(prompt, 20000);
 }
 
 /**
@@ -499,7 +548,7 @@ Reply JSON only:
  * @param {string} handWrittenContent - Hand-written CLAUDE.md content
  * @returns {{ patterns: Array, anti_patterns: Array, summary: string, index_line: string }}
  */
-function analyzeObservations(observations, existingRules, handWrittenContent) {
+function analyzeObservations(observations, existingRules, handWrittenContent, tier) {
   if (!observations || observations.length < 3) {
     return { patterns: [], anti_patterns: [], summary: '', index_line: '' };
   }
@@ -517,7 +566,8 @@ function analyzeObservations(observations, existingRules, handWrittenContent) {
     `- ${r.content.slice(0, 100)}`
   ).join('\n') || '(none)';
 
-  const handWrittenDesc = (handWrittenContent || '').slice(0, 1500);
+  // Already budgeted by the caller (llmBrain.budgetLayers); not cut again here
+  const handWrittenDesc = handWrittenContent || '';
 
   const prompt = `You are a behavior analysis engine. Analyze a full session timeline to extract learnable patterns.
 
@@ -527,8 +577,8 @@ ${timeline.slice(0, 8000)}
 EXISTING AUTO-LEARNED RULES:
 ${existingRulesDesc}
 
-HAND-WRITTEN CLAUDE.MD RULES:
-${handWrittenDesc.slice(0, 1500)}
+HAND-WRITTEN INSTRUCTIONS AND MEMORIES:
+${handWrittenDesc || '(none)'}
 
 Analyze the timeline and extract:
 
@@ -550,7 +600,7 @@ Reply JSON only:
 
 No patterns found? Return empty arrays. Be conservative — only report clear, repeated, actionable patterns.`;
 
-  return askClaudeWithRetry(prompt, 45000, 'smart');
+  return askClaudeWithRetry(prompt, 45000, tier || 'smart');
 }
 
 /**
@@ -624,7 +674,7 @@ Reply JSON only:
  * @param {Array} corrections - Feedback memories
  * @returns {{ evaluations: [{ rule_id, score: 0-10, reason }], revive: [rule_id] }}
  */
-function evaluateRuleSet(activeRules, observations, corrections) {
+function evaluateRuleSet(activeRules, observations, corrections, tier) {
   if (!activeRules || activeRules.length === 0) return { evaluations: [], revive: [] };
 
   const rulesDesc = activeRules.map(r =>
@@ -661,7 +711,7 @@ ${corrDesc}
 Reply JSON only:
 {"evaluations": [{"rule_id": "<id>", "score": N, "reason": "<one sentence>"}], "revive": []}`;
 
-  return askClaudeWithRetry(prompt, 25000, 'fast');
+  return askClaudeWithRetry(prompt, 25000, tier || 'fast');
 }
 
 /**
@@ -732,7 +782,7 @@ Reply JSON only:
  * @param {Array} activeRules
  * @returns {{ actions: [{ type: 'merge'|'rewrite'|'remove', ... }] }}
  */
-function cleanupRules(activeRules) {
+function cleanupRules(activeRules, tier) {
   if (!activeRules || activeRules.length < 5) return { actions: [] };
 
   const rulesDesc = activeRules.map(r =>
@@ -760,7 +810,7 @@ Reply JSON only:
 
 No changes needed? Reply: {"actions": []}`;
 
-  return askClaudeWithRetry(prompt, 25000, 'smart');
+  return askClaudeWithRetry(prompt, 25000, tier || 'smart');
 }
 
 /**
@@ -862,7 +912,7 @@ FORMAT RULES:
 
 Output ONLY the raw file content starting with ---. No explanation.`;
 
-  const result = askClaudeWithRetry(prompt, 45000, 'smart');
+  const result = askClaudeWithRetry(prompt, 45000, 'smart', 1, { system: SKILL_SYSTEM_PROMPT, expectJson: false });
 
   if (!result) return null;
 
@@ -894,17 +944,21 @@ Output ONLY the raw file content starting with ---. No explanation.`;
 
 module.exports = {
   askClaude,
+  askClaudeWithRetry,
+  getCliCaps,
+  cliArgs,
+  getStats,
+  resetStats,
+  budgetLayers,
   extractRule,
-  checkConflict,
+  checkContradictions,
   matchCorrections,
   tryDistill,
-  suggestConflictResolution,
   analyzeSessionPatterns,
   selectStrategy,
   reflectOnRules,
   analyzeObservations,
   compressSession,
-  checkConflictBatch,
   // Signal-gene operators
   triage,
   evaluateRuleSet,
@@ -912,4 +966,5 @@ module.exports = {
   // Continuum writer
   classifyComplexity,
   generateSkillContent,
+  MODELS,
 };

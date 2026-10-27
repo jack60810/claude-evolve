@@ -7,16 +7,30 @@
 //   Tier 3: session .md full — complete observations (on-demand, rarely needed)
 //
 // Raw observations (temp .jsonl) are deleted after compression.
+//
+// Each project root has its own index file, so session-start only shows the current
+// project's history. Session files older than 90 days, or beyond the newest 500, are pruned.
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
+const { DATA_DIR } = require('./paths');
+const { writeFileAtomic, withLock } = require('./fsutil');
 
-const DATA_DIR = path.join(__dirname, 'data');
 const MEMORY_DIR = path.join(DATA_DIR, 'memory');
 const SESSIONS_DIR = path.join(MEMORY_DIR, 'sessions');
-const INDEX_PATH = path.join(MEMORY_DIR, 'index.md');
+const INDEX_DIR = path.join(MEMORY_DIR, 'index');
+const INDEX_PATH = path.join(MEMORY_DIR, 'index.md'); // legacy global index (no project root known)
+const PRUNE_MARKER = path.join(MEMORY_DIR, '.last_prune');
 
-const MAX_INDEX_LINES = 50; // Keep last 50 sessions in index
+const MAX_INDEX_LINES = 50; // Keep last 50 sessions per project index
+const KEEP_SESSIONS = 500;
+const KEEP_DAYS = 90;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+// Observation temp files: one per Claude Code session, keyed by the hook payload's session_id.
+const OBS_PREFIX = 'claude-evolve-';
 
 // --- Directory setup ---
 
@@ -26,10 +40,46 @@ function ensureDirs() {
 
 // --- Session ID ---
 
-function generateSessionId() {
+/**
+ * Session-memory id: "<YYYY-MM-DD>_<suffix>". The date prefix is parsed elsewhere.
+ * With a Claude session_id, the suffix is its first 8 alphanumerics (traceable to the
+ * transcript) plus 24 random bits, so a resumed session never overwrites its earlier
+ * summary. Without one, the suffix is 48 random bits.
+ */
+function generateSessionId(claudeSessionId) {
   const date = new Date().toISOString().slice(0, 10);
-  const hash = Math.random().toString(36).slice(2, 5);
-  return `${date}_${hash}`;
+  const sid = String(claudeSessionId || '').replace(/[^A-Za-z0-9]/g, '').slice(0, 8).toLowerCase();
+  return `${date}_${sid}${crypto.randomBytes(sid ? 3 : 6).toString('hex')}`;
+}
+
+// --- Observation temp file (written by post-tool, read by session-end) ---
+
+function sessionKey(payload) {
+  const id = (payload && payload.session_id) || `ppid-${process.ppid}`;
+  return String(id).replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 128);
+}
+
+function observationFile(key) {
+  return path.join(os.tmpdir(), `${OBS_PREFIX}${key}.jsonl`);
+}
+
+/**
+ * Create the observation file with its session record, unless it already exists.
+ * pid is the Claude process (the hook's parent), used by the session-start sweep.
+ */
+function startObservationFile(file, sessionId, cwd) {
+  const header = { type: 'session', sessionId, startMs: Date.now(), pid: process.ppid, cwd };
+  try {
+    fs.writeFileSync(file, JSON.stringify(header) + '\n', { flag: 'wx', mode: 0o600 });
+  } catch (e) {
+    if (e.code !== 'EEXIST') throw e;
+  }
+}
+
+/** Split raw records into the session record and the tool observations. */
+function splitObservations(records) {
+  const header = records.find(r => r.type === 'session') || null;
+  return { header, observations: records.filter(r => r.type !== 'session') };
 }
 
 // --- Read observations from temp file ---
@@ -98,44 +148,70 @@ function writeSession(sessionId, compressed, observations, meta) {
 
   const content = lines.join('\n') + '\n';
   const filePath = path.join(SESSIONS_DIR, `${sessionId}.md`);
-  const tmp = filePath + '.tmp';
-  fs.writeFileSync(tmp, content, 'utf8');
-  fs.renameSync(tmp, filePath);
+  writeFileAtomic(filePath, content);
+  try { pruneSessions(); } catch {}
 
   return filePath;
 }
 
-// --- Update index.md (Tier 1) ---
+// --- Retention ---
 
 /**
- * Append a one-line entry to index.md and trim to MAX_INDEX_LINES.
+ * Delete session files older than KEEP_DAYS or beyond the newest KEEP_SESSIONS
+ * (whichever keeps fewer). Runs at most once a day, tracked by a marker file.
+ */
+function pruneSessions(now = Date.now()) {
+  try {
+    if (now - fs.statSync(PRUNE_MARKER).mtimeMs < DAY_MS) return 0;
+  } catch {}
+  ensureDirs();
+  fs.writeFileSync(PRUNE_MARKER, new Date(now).toISOString() + '\n');
+
+  const files = [];
+  for (const f of fs.readdirSync(SESSIONS_DIR)) {
+    if (!f.endsWith('.md')) continue;
+    const fp = path.join(SESSIONS_DIR, f);
+    try { files.push({ fp, mtime: fs.statSync(fp).mtimeMs }); } catch {}
+  }
+  files.sort((a, b) => b.mtime - a.mtime);
+  let removed = 0;
+  files.forEach((f, i) => {
+    if (i < KEEP_SESSIONS && now - f.mtime <= KEEP_DAYS * DAY_MS) return;
+    try { fs.unlinkSync(f.fp); removed++; } catch {}
+  });
+  return removed;
+}
+
+// --- Update the project index (Tier 1) ---
+
+/** Index file for a project root: <basename>-<hash>.md under memory/index/. */
+function indexPathFor(projectRoot) {
+  const hash = crypto.createHash('sha1').update(projectRoot).digest('hex').slice(0, 10);
+  return path.join(INDEX_DIR, `${path.basename(projectRoot) || 'root'}-${hash}.md`);
+}
+
+/**
+ * Append a one-line entry to the project's index and trim to MAX_INDEX_LINES.
  *
  * @param {string} sessionId
  * @param {string} indexLine - One-line summary from LLM
  * @param {number} obsCount - Number of observations
- * @param {string} project - Project name
+ * @param {string} project - Project root (absolute path). A bare name falls back to the
+ *   legacy global index, which session-start never reads.
  */
 function appendIndex(sessionId, indexLine, obsCount, project) {
-  ensureDirs();
+  const file = path.isAbsolute(project || '') ? indexPathFor(project) : INDEX_PATH;
+  const date = String(sessionId).split('_')[0];
+  const line = `- [${date}] (${sessionId}) ${path.basename(project || 'unknown')}: ${indexLine} | ${obsCount} obs`;
 
-  const date = sessionId.split('_')[0];
-  const line = `- [${date}] (${sessionId}) ${project}: ${indexLine} | ${obsCount} obs`;
-
-  let existing = [];
-  try {
-    existing = fs.readFileSync(INDEX_PATH, 'utf8').trim().split('\n').filter(Boolean);
-  } catch {}
-
-  existing.push(line);
-
-  // Keep only last N lines
-  if (existing.length > MAX_INDEX_LINES) {
-    existing = existing.slice(-MAX_INDEX_LINES);
-  }
-
-  const tmp = INDEX_PATH + '.tmp';
-  fs.writeFileSync(tmp, existing.join('\n') + '\n', 'utf8');
-  fs.renameSync(tmp, INDEX_PATH);
+  withLock(file, () => {
+    let existing = [];
+    try {
+      existing = fs.readFileSync(file, 'utf8').trim().split('\n').filter(Boolean);
+    } catch {}
+    existing.push(line);
+    writeFileAtomic(file, existing.slice(-MAX_INDEX_LINES).join('\n') + '\n');
+  });
 
   return line;
 }
@@ -143,13 +219,15 @@ function appendIndex(sessionId, indexLine, obsCount, project) {
 // --- Read index for session-start injection (Tier 1) ---
 
 /**
- * Read the last N lines of index.md for session-start context.
+ * Read the last N lines of a project's index for session-start context.
  * @param {number} maxLines - Max lines to return (default 15)
+ * @param {string|null} projectRoot - Project root; null returns nothing
  */
-function readIndex(maxLines) {
+function readIndex(maxLines, projectRoot) {
+  if (!projectRoot) return [];
   const n = maxLines || 15;
   try {
-    const lines = fs.readFileSync(INDEX_PATH, 'utf8').trim().split('\n').filter(Boolean);
+    const lines = fs.readFileSync(indexPathFor(projectRoot), 'utf8').trim().split('\n').filter(Boolean);
     return lines.slice(-n);
   } catch { return []; }
 }
@@ -187,18 +265,20 @@ function readSessionFull(sessionId) {
 // --- Search sessions by keyword ---
 
 /**
- * Search index.md for sessions matching a query.
+ * Search a project's index for sessions matching a query.
  * Returns matching index lines + session IDs.
  * @param {string} query - Search terms
  * @param {number} maxResults - Max results (default 5)
+ * @param {string} [projectRoot] - Project root; omitted searches the legacy global index
  */
-function searchSessions(query, maxResults) {
+function searchSessions(query, maxResults, projectRoot) {
   const max = maxResults || 5;
   const terms = query.toLowerCase().split(/\s+/).filter(t => t.length > 1);
   if (terms.length === 0) return [];
 
   try {
-    const lines = fs.readFileSync(INDEX_PATH, 'utf8').trim().split('\n').filter(Boolean);
+    const file = projectRoot ? indexPathFor(projectRoot) : INDEX_PATH;
+    const lines = fs.readFileSync(file, 'utf8').trim().split('\n').filter(Boolean);
     const results = [];
 
     for (const line of lines.reverse()) { // newest first
@@ -238,6 +318,10 @@ function listSessions(maxCount) {
 
 module.exports = {
   generateSessionId,
+  sessionKey,
+  observationFile,
+  startObservationFile,
+  splitObservations,
   readObservations,
   writeSession,
   appendIndex,
@@ -246,6 +330,9 @@ module.exports = {
   readSessionFull,
   searchSessions,
   listSessions,
+  pruneSessions,
+  indexPathFor,
+  OBS_PREFIX,
   MEMORY_DIR,
   SESSIONS_DIR,
   INDEX_PATH,

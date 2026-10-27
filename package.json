@@ -1,8 +1,16 @@
 {
   "name": "claude-evolve",
   "version": "0.1.0",
+  "private": true,
   "description": "Self-evolving learning system for Claude Code — learns from your corrections and behavior patterns, auto-writes rules to CLAUDE.md",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jack60810/claude-evolve.git"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
   "engines": {
     "node": ">=18"
   },

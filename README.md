@@ -1,35 +1,132 @@
 # claude-evolve
 
-Claude Code watches what you do. This watches what Claude Code does, and makes it better at working with you.
+Claude Code watches what you do. claude-evolve watches what Claude Code does. It finds the mistakes and habits that repeat, and writes them back as rules for your next session. A rule that keeps paying off can grow into a full Claude Code skill. A rule nobody uses fades out.
 
-Most "memory" tools for AI assistants just store and retrieve. claude-evolve **evolves** — it spots your mistakes before you correct them, learns patterns you never explicitly teach, prunes rules that stop helping, and gets sharper every session. After enough sessions, it graduates from rules to full **Claude Code skills** that capture how you think.
+Before you install it, here's what it needs and what it does to your machine.
 
-## See it in action (2 minutes to set up, 10 minutes to see)
+- Needs: the `claude` CLI on your PATH, Node 18 or newer, and macOS or Linux.
+- Costs: one background run when a session ends, usually 3 to 8 `claude --print` calls. Haiku does triage and classification. Sonnet writes the session summary, handles complex sessions and writes skills. A failed call is retried once. Sessions with fewer than 3 tool calls and no new memory are skipped. The calls use your own `claude` login. `runs.jsonl` logs the exact count of every run.
+- Writes: `CLAUDE.local.md` and `.claude/skills/auto-*/` in your project folder: the git top level inside a repo, the launch folder outside one. It also writes a data directory (`learning/data/` by default) and three hook entries in `~/.claude/settings.json`, which it backs up first.
+- Sends: redacted excerpts of your tool calls, plus your rules, memories and instruction files, to Anthropic through `claude --print`. [Details below](#what-it-reads-sends-and-writes).
 
-Don't want to read docs? Just pick a profession and watch the system learn:
+## Install
 
 ```bash
 git clone https://github.com/jack60810/claude-evolve.git
 cd claude-evolve
-node demo.js analyst          # or ios-engineer, game-developer, ml-ops, random...
+node setup.js
+node setup.js --check
 ```
 
-The demo:
-1. Asks Claude (sonnet) to generate realistic deep work sessions for that profession
-2. Runs each session through the learning pipeline (just like a real user would)
-3. Observes patterns, scores rules, promotes mature ones to a skill
-4. Prints the final `CLAUDE.md` and `.claude/skills/auto-*.md` for you to read
+It isn't on npm. The `claude-evolve` package there is a different project, so install from git.
 
-You'll see, in real output, the skill the system learned — the user's **thinking model**, not just their steps. Different profession = different skill. No hardcoded templates.
+`setup.js` adds three hooks to `~/.claude/settings.json`: SessionStart, PostToolUse and SessionEnd. Your other settings and hooks stay as they are. Before it writes, it saves a copy next to the file as `settings.json.bak-<timestamp>`. If the file isn't valid JSON, it stops and changes nothing. Running it twice is safe. `--check` lists each hook with its event and exits 1 when something is missing.
+
+Keep the clone where it is, because the hooks point at its path. If you move it, run `node setup.js` again to rewrite the paths. To update, run `git pull`. Then start a new Claude Code session.
+
+Each hook takes about 50 ms. The slow work happens in a detached process after the session ends.
+
+### Uninstall
+
+```bash
+node setup.js --remove
+```
+
+This takes the hooks out of settings and leaves everything else. To wipe the rest, delete `CLAUDE.local.md` and `.claude/skills/auto-*` in your projects, and the data directory.
+
+### Upgrading from an older version
+
+Older versions put the end-of-session hook on Stop, which fires after every response. They also wrote rule blocks into the CLAUDE.md of whatever folder you started in. `node setup.js` moves the hook to SessionEnd. For the leftover blocks:
+
+```bash
+node setup.js --clean-stale          # dry run, writes nothing
+node setup.js --clean-stale --yes    # applies it
+```
+
+It removes the blocks in your home folder, in its parents, in ignored folders and in subfolders of a git repo. For every other block, it rebuilds the block in `CLAUDE.local.md` from the rules that are active in the store right now. Rules that are dormant there don't come along, so an old block can shrink or vanish. Every file it touches is copied to `<data dir>/backups/clean-stale-<timestamp>/` first.
+
+The first run after an upgrade also does some housekeeping:
+
+- It migrates the rule store and keeps the old file as `rules.v2.bak.json`.
+- It archives retired rules and candidates older than 30 days to `rules_archive.jsonl`.
+- It drops pending files older than 7 days.
+- It prunes session summaries beyond 90 days or the newest 500.
+- The first time it edits an existing CLAUDE.md, it copies the original to `<data dir>/backups/writer/`. Then it moves the auto block to `CLAUDE.local.md`.
+
+<details>
+<summary>Manual setup, if you'd rather edit the JSON</summary>
+
+Add these to `~/.claude/settings.json` and merge them into any hooks you already have. Use the absolute path to your clone.
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{ "matcher": "", "hooks": [{ "type": "command", "timeout": 3,
+      "command": "node \"/FULL/PATH/TO/claude-evolve/learning/hooks/session-start.js\"" }] }],
+    "PostToolUse": [{ "matcher": "", "hooks": [{ "type": "command", "timeout": 2,
+      "command": "node \"/FULL/PATH/TO/claude-evolve/learning/hooks/post-tool.js\"" }] }],
+    "SessionEnd": [{ "matcher": "", "hooks": [{ "type": "command", "timeout": 8,
+      "command": "node \"/FULL/PATH/TO/claude-evolve/learning/hooks/session-end.js\"" }] }]
+  }
+}
+```
+
+</details>
+
+## What it reads, sends and writes
+
+What it reads on your machine:
+
+- Every tool call in a session. That's the tool name, the input (cut at 2,000 characters) and the output (cut at 4,000).
+- Your Claude Code memories for the project, from `~/.claude/projects/<project>/memory`. New feedback memories are the source of corrections.
+- Your instruction files: CLAUDE.md and CLAUDE.local.md from the project folder up to `/`, and `~/.claude/CLAUDE.md`. They feed the contradiction check.
+
+What it sends:
+
+- Short excerpts of the session's tool calls go to Anthropic through `claude --print`, under your own login. So do the project's rules, your memories and your instruction text.
+- Each call runs with tools off, in an empty temp folder. With `--safe-mode`, the child sees no CLAUDE.md, skills, plugins, hooks or MCP servers. It uses that flag when your CLI has it, and `--strict-mcp-config` when it doesn't. It also sets `CLAUDE_EVOLVE_CHILD=1`, so these runs are not recorded.
+- Tool calls are redacted before they reach disk. `learning/redact.js` replaces private keys, `sk-` API keys, and GitHub, AWS, Slack, Notion and Google tokens. It also replaces Bearer tokens and values stored under names like token, secret, password, api key or authorization. It's pattern matching, so an unusual secret can slip through. Instruction files and memories that existed before the session are sent as written, so keep secrets out of them.
+
+What it writes:
+
+- During a session: `claude-evolve-<session>.jsonl` in your temp folder, mode 0600. It's deleted when the session ends.
+- In the project folder: `CLAUDE.local.md` and `.claude/skills/auto-<name>/SKILL.md`. Your home folder and its parents never get rules. Inside a git repo, both files go into `.git/info/exclude`, so git ignores them. Outside git, nothing is excluded. In `CLAUDE.local.md`, only the block between the claude-evolve markers is ours. To share rules with your team, set `RULES_FILENAME` to `'CLAUDE.md'` in `learning/claudeMdWriter.js`. That file is not excluded, and the rules come from your own sessions, so read them before you commit.
+- In the data directory: the rule store (`rules.json` and a `.bak` copy), `rules_archive.jsonl` for pruned rules, and `changelog.jsonl`. `runs.jsonl` has one line per run with its LLM call and failure counts. `memory/` holds session summaries and a per-project index. Smaller files cover cross-project patterns, skill notices, your tool-usage profile and the logs.
+- Limits: logs rotate to a `.1` file at around 1 MB. Session memories are pruned after 90 days or past the newest 500.
+- In `~/.claude/settings.json`: the three hooks, nothing else.
+
+How to turn it off:
+
+- `node setup.js --remove` stops it everywhere.
+- An empty `.claude-evolve-ignore` file in a folder skips that folder: no rules, no LLM calls. Subfolders don't inherit it, so it suits a container folder like `~/code` that you sometimes launch from. In a git repo, put it at the top level to skip the whole repo.
+- `CLAUDE_EVOLVE_CHILD=1 claude` runs one session unobserved. The hooks exit at once when that variable is set.
+- `CLAUDE_EVOLVE_DATA_DIR=/some/dir` moves the data directory. Set it in the environment Claude Code starts from, so every hook sees the same value. The demo and the tests use it too.
+
+## See it in action
+
+You can watch the loop learn a profession without using it for real:
+
+```bash
+node demo.js analyst      # or ios-engineer, game-developer, ml-ops, chef, random...
+```
+
+This one uses the real pipeline, so it needs the `claude` CLI and makes real calls, roughly 20 to 30 of them. It prints a time estimate, about 4 minutes with the defaults.
+
+1. Claude (haiku by default) invents a profile for the profession and 3 work sessions of 8 tool calls each.
+2. Each session goes through the same pipeline a real one would.
+3. A real skill needs rules that came up in 5 or more sessions. If fewer than 3 rules are mature, the demo sets their scores by hand to stand in for that. Then the skillify step runs.
+4. It prints `CLAUDE.local.md` and any `.claude/skills/auto-*/SKILL.md` it produced.
+
+Flags: `--sessions=N` (default 3, up to 10), `--depth=N` (tool calls per session, 5 to 20, default 8), `--sequential`, and `--model=sonnet` for richer sessions.
+
+The demo gets its own git repo and its own data directory under `demo-output/`, so your real learning data stays untouched. Delete `demo-output/` when you're done.
 
 ### Two example outputs (not for programmers)
 
-To show this isn't just a coding tool — here are two skills the system
-produced, each from 3 simulated sessions of someone doing their real job.
-No code involved, no hardcoded templates, no pre-written rules.
+Here are two skills the system produced from 3 simulated sessions each. Nobody wrote a template or a starter rule. Different jobs gave different thinking models.
 
 <details>
-<summary><b>Example 1: Kindergarten Principal</b> — admin work (scheduling, classroom observations, budgets)</summary>
+<summary>Example 1: Kindergarten Principal (admin work: scheduling, classroom observations, budgets)</summary>
 
 ```markdown
 ---
@@ -82,7 +179,7 @@ treated as final.
 </details>
 
 <details>
-<summary><b>Example 2: Bus Driver</b> — safety ops (pre-trip checks, fault diagnosis, route changes)</summary>
+<summary>Example 2: Bus Driver (safety ops: pre-trip checks, fault diagnosis, route changes)</summary>
 
 ```markdown
 ---
@@ -132,367 +229,186 @@ Diagnose → Communicate → Act → Verify. Skipping any step — even for a "q
 
 </details>
 
-Two completely different jobs → two completely different thinking models.
-The principal's skill is about *correctness*. The driver's skill is about
-*sequence*. Both inferred from behavior alone.
+The principal's skill is about correctness. The driver's is about sequence. Both were inferred from behavior alone.
 
-Try your own: `node demo.js chef`, `emergency-nurse`, `security-guard`,
-`game-developer`, or `random`.
+## Anti-pattern detection
 
-## The thing that matters most: anti-pattern detection
-
-Other tools wait for you to say "don't do that." claude-evolve watches the full session timeline — every Read, Edit, Bash, every MCP call — and spots suboptimal behaviors on its own.
-
-Edit without Read first? It notices. Query without dry-run? It notices. Same file opened 4 times because grep wasn't used? It notices.
-
-These become corrective rules automatically. You don't have to say anything.
+You don't have to say "don't do that" for a rule to appear. claude-evolve reads the whole timeline of a session: every Read, Edit, Bash and MCP call. It asks the model for two lists, habits worth keeping and mistakes. The prompt's own examples are editing without reading first, and running a database query with no dry run or date filter. The mistakes become corrective rules without you saying anything.
 
 ```markdown
-<!-- evolver:rule id=r_ghi score=7 created=2026-04-16 source=anti_pattern -->
-- Always Read a file before Edit — blind edits cause errors
-<!-- /evolver:rule -->
+<!-- claude-evolve:rule id=r_mo4aod2m_8ogc -->
+- Always Read a file before Edit, because blind edits cause errors
+<!-- /claude-evolve:rule -->
 ```
 
-This is the difference between a memory system and a learning system.
+This needs at least 3 tool calls in the session. The model is told to be conservative and to report only clear, repeated patterns.
 
-## From rules to skills: the Continuum
+## From rules to skills
 
-claude-evolve doesn't just write rules. It outputs at the right level of abstraction based on how mature a pattern is:
+A new rule starts as a single instruction. A haiku call classifies it as simple, compound, workflow or methodology. The first three render in `CLAUDE.local.md`. A methodology rule goes into a skill instead.
 
-```
-Session 1-5:    simple rules      →  "Always dry_run before BQ queries"
-Session 5-10:   compound rules    →  Multi-step checklist in CLAUDE.md
-Session 10+:    methodology       →  Full .claude/skills/ file
-```
+A rule counts as mature when its score is above 7 across at least 5 sessions where it came up. When 3 or more rules are mature, the skillify gene marks them as methodology. Sonnet then writes one skill for the project. It draws on your feedback memories to describe how you think, not only which steps you take. That covers what you check first, what you do without being asked, and what Claude should avoid.
 
-When enough related rules accumulate high scores, the system promotes them into a Claude Code skill file. The skill isn't a copy of the rules — Claude (sonnet) synthesizes them with your memories (corrections, preferences, project context) to produce a **thinking model**:
-
-```markdown
-## Thinking Model
-
-This user's thinking order is: cheap → correct → complete.
-
-Cost is the first gate, not an afterthought.
-Don't wait to be told — if scan exceeds 5GB, proactively suggest narrowing.
-
-Iteration is the default, not the backup.
-LIMIT 10 first, confirm logic, then expand. Never run the full query on first try.
-
-## What NOT to do
-- Don't run full queries without dry_run
-- Don't give absolute numbers without a comparison baseline
-```
-
-Skills live in `.claude/skills/auto-*.md`. They follow the standard Claude Code skill format with triggers, so Claude loads them automatically. Skills that stop being useful get demoted back to rules, and eventually pruned. The whole lifecycle is bidirectional.
-
-### Automatic skill routing
-
-When a skill is generated, the system also writes a **Skill Routing** block into the project's `CLAUDE.md`. This is how Claude Code knows when to load the skill:
+The skill lives in `.claude/skills/auto-<name>/SKILL.md`, and a Skill Routing block in `CLAUDE.local.md` tells Claude when to load it:
 
 ```markdown
 <!-- claude-evolve:managed-start -->
+## Auto-learned Rules
+
 <!-- claude-evolve:skill-routing -->
 ### Skill Routing
 
-- **auto-bq-safe-analysis** (.claude/skills/auto-bq-safe-analysis.md):
-  Cost-aware, correctness-first BigQuery analytics thinking model
-  Triggers: run a BigQuery query, analyze experiment results, write a funnel query, ...
+The following skills were auto-generated from observed work patterns. Use them when the trigger matches:
+
+- **auto-bq-safe-analysis** (.claude/skills/auto-bq-safe-analysis/SKILL.md): Cost-aware, correctness-first BigQuery analytics thinking model
+  Triggers: run a BigQuery query, analyze experiment results, write a funnel query
 
 When any of these triggers match, load and follow the corresponding skill before proceeding.
 <!-- /claude-evolve:skill-routing -->
+
 <!-- claude-evolve:managed-end -->
 ```
 
-No manual wiring needed. The full loop — observe → learn → promote → route → Claude follows the skill — is automatic.
+If you edit a skill file, claude-evolve notices (it keeps a content hash) and stops touching it. If a skill's rules stop earning their score, they're demoted and the skill file goes away, unless you've edited it.
 
-Cross-project transfer: when you start a new project of the same type (e.g., another analysis project), the system suggests patterns it learned from your other projects.
+Mature patterns that aren't simple rules are also saved to a shared store, keyed by project type (analysis, backend, infra, documentation or general). When you open another project of the same type, session start lists up to 3 of them as information. Nothing is applied for you.
 
-### What the demo shows
+## When this helps
 
-The `demo.js` script is the easiest way to understand what claude-evolve actually does. It simulates 6 deep multi-turn sessions for any profession (10-16 tool calls each, with realistic investigation → mistakes → corrections → validation), then shows you the final `CLAUDE.md` and skill file the system produced.
+Use it if you work in Claude Code most days, across projects, and keep correcting Claude on the same things. It also suits you if your projects have conventions Claude keeps forgetting. And it's for you if you want Claude to learn how you work, not only what you type.
 
-For each profession, the generated skill captures domain-specific thinking:
-an analyst's skill talks about dry-runs and sanity checks, a backend skill
-talks about EXPLAIN plans and smoke tests, an iOS skill talks about retain
-cycles and `prepareForReuse` — all inferred from behavior alone.
+Skip it if you use Claude Code about once a week, or your sessions are short (under 3 tool calls teach it nothing). Skip it if you don't want background LLM calls. If you want semantic search over past sessions, try [claude-mem](https://github.com/thedotmack/claude-mem).
 
-The demo uses an isolated output directory (`demo-output/`) and cleans up
-after itself. It doesn't touch your real project learning.
-
-## When this helps / When it doesn't
-
-**This is for you if:**
-- You use Claude Code daily across multiple projects
-- You find yourself correcting Claude on the same things repeatedly
-- You have project-specific conventions that Claude keeps forgetting
-- You want Claude to learn your workflow, not just your words
-
-**This is NOT for you if:**
-- You use Claude Code once a week or less (not enough sessions for patterns to emerge)
-- Your sessions are short and simple (< 5 tool calls, nothing to learn from)
-- You don't want any background LLM calls (each session end makes 2-3 haiku/sonnet calls)
-- You want a vector database for semantic search (use [claude-mem](https://github.com/thedotmack/claude-mem) instead)
-
-The system needs ~5 sessions before it starts producing useful rules. ~10 sessions before skills start emerging. If you're not going to give it that runway, it's overhead.
-
-## Origin story
-
-This project was inspired by [Evolver](https://github.com/EvoMap/evolver) by the EvoMap team — a GEP (Gene Expression Programming) engine that enables AI agents to self-evolve their own code.
-
-I originally wanted to use Evolver as-is, but realized I didn't need a full autonomous self-evolution agent. What I needed was simpler: **I wanted Claude Code to get better at working with me, session after session.**
-
-So I took the core ideas — signal detection, gene-based actions, LLM evaluation, solidification — and applied them not to code evolution, but to **learning how a human works**. Every session is observed. Rules that help stay; rules that don't get demoted. The "genome" isn't source code — it's each project's `CLAUDE.md`.
-
-Huge thanks to the Evolver / EvoMap team for the original vision. This project wouldn't exist without their work.
+Expect little from the first few sessions. A skill needs at least 5 sessions behind each of 3 rules, so it takes a while.
 
 ## How it works
 
 ```
 You use Claude Code normally
         ↓
-Hooks observe every session:
-  - Full tool input/output (what you read, edit, run)
-  - When you correct Claude's behavior
-  - What patterns repeat across sessions
+Hooks (about 50 ms each):
+  SessionStart  inject this project's recent history, rule count and notices
+  PostToolUse   append a redacted record of each tool call to a temp file
+  SessionEnd    hand the session to a detached processor (once per session)
         ↓
-Session ends → background pipeline:
-
-  Triage (haiku):
-    "What happened? Which gene? How complex?"
-    → { gene: "repair", complexity: "routine" }
+Processor, in the background:
+  Triage (haiku)      which gene, and is it routine or complex?
+  Gene (haiku, or     repair:   rules from new corrections
+   sonnet if complex) innovate: patterns and anti-patterns from the timeline
+                      optimize: LLM scores the active rules
+                      cleanup:  merge, rewrite or remove rules
+                      skillify: promote mature rules to a skill
+                      observe:  quiet session, record only
+  Check               contradictions against every instruction layer and memory
+  Apply               add rules, score, decay, demote, promote, prune (no LLM)
+  Solidify            rules to CLAUDE.local.md, methodology to a skill
+  Summarize (sonnet)  session summary into session memory
         ↓
-  Gene execute (haiku for routine, sonnet for complex):
-    repair:   extract rules from corrections
-    innovate: detect patterns + anti-patterns from observations
-    optimize: LLM scores all active rules 0-10, demotes low scorers
-    cleanup:  merge / rewrite / remove redundant rules
-    skillify: promote mature rule groups → .claude/skills/ files
-    observe:  quiet session, just record
-        ↓
-  Validate: check for conflicts with hand-written rules
-        ↓
-  Classify complexity: simple / compound / workflow / methodology
-        ↓
-  Solidify: route output by complexity level
-    simple/compound/workflow → CLAUDE.md
-    methodology → .claude/skills/auto-*.md (via Claude sonnet)
-        ↓
-Next session: Claude follows learned rules + has session history
+Next session: Claude Code loads CLAUDE.local.md and the skills like any other instruction file
 ```
 
-## Key features
+If Claude Code dies without firing SessionEnd, the next SessionStart finds the leftover observation file and processes it.
 
-### Anti-pattern detection
-Watches the full session timeline and spots suboptimal behaviors — editing without reading, querying without dry-run, repetitive file opens. Creates corrective rules without you saying a word.
+Triage picks the gene. If the triage call fails, a heuristic picks it instead, checking these in order:
 
-### LLM triage + model routing
-Each session is triaged by a fast haiku call that determines what action to take and how complex it is. Routine work (simple correction, minor observation) stays on haiku. Complex work (methodology changes, conflicting patterns, major restructuring) escalates to sonnet. You pay for intelligence only when it matters.
+1. New memories: repair.
+2. 3 or more tool calls: innovate.
+3. Mature rules: skillify.
+4. 8 or more active rules: cleanup.
+5. Every third session: optimize.
+6. Anything else: observe.
 
-### Observation-based learning
-Records full tool input/output (not just tool names). The LLM sees what you actually did and extracts actionable rules from real behavior.
+### Rules and their lifecycle
 
-### LLM-driven scoring
-Rules are scored 0-10 by the LLM based on relevance and usefulness to each session. Scores use exponential moving average (30% new, 70% history) to smooth out noise. No hardcoded formulas — the LLM judges directly.
+| Status | Meaning |
+|--------|---------|
+| active | Written to `CLAUDE.local.md`. At most 10 per project. |
+| candidate | Over the cap, waiting for a free slot. Pruned after 30 days. |
+| dormant | Demoted, duplicated, merged away or contradicted. Can be revived. Pruned after 60 days. |
 
-### Evolver-style pipeline
-Inspired by [Evolver](https://github.com/EvoMap/evolver)'s architecture: Signal → Gene → Execute → Validate → Solidify. Simple, predictable, each step has a clear purpose.
+Pruned rules are appended to `rules_archive.jsonl`.
 
-### Population lifecycle
-Rules live in three states: **active** (in CLAUDE.md), **dormant** (demoted but preserved — environment changes might make them useful again), **dead** (dormant too long). Nothing is deleted immediately.
+| Scoring | Details |
+|---------|---------|
+| Scale | 0 to 10. A new rule starts at 5. |
+| Every session (no LLM) | Keyword hits in the session's tool calls move the score as a moving average. A strong hit pulls toward 8 and a partial hit toward 6, both with weight 0.3. No hit pulls toward 2 with weight 0.1, so unused rules decay slowly. |
+| Optimize gene | The LLM scores each active rule 0 to 10. The result joins the same moving average with weight 0.3. |
+| Demotion | Score under 3 after 3 or more evaluations: the rule goes dormant and drops one complexity level. |
+
+### Conflicts
+
+Every new, merged, rewritten or revived rule is checked against your instructions and memories. The instructions are the CLAUDE.md and CLAUDE.local.md files from the project folder upward, plus `~/.claude/CLAUDE.md`. If a rule contradicts them, your text wins and the rule is not applied. A new rule is stored as dormant, and the changelog records why. There's nothing for you to answer.
 
 ### Session memory
-Every session is compressed into a structured `.md` file with summary, key decisions, and full observation timeline. A compact index is injected at session start.
 
-### Skill generation
-When 3+ related rules accumulate high scores over multiple sessions, the system promotes them to a `.claude/skills/` file. Claude (sonnet) generates the skill content, incorporating your feedback memories to produce a "thinking model" — not just steps, but how you approach a class of problems. Skills are scored and can be demoted back to rules if they stop being useful.
+Each processed session becomes a markdown file in `<data dir>/memory/sessions/`: a summary, the key decisions, and the tool-call timeline. Each project has a short index, and session start injects its last 10 lines. The files are plain text, so open them when you want the detail.
 
-### Cross-project learning
-Mature patterns are saved to a shared store keyed by project type (analysis, backend, infra). When you start a new project of the same type, the system suggests patterns from your other projects. Transfer is opt-in — you confirm before applying.
+## What the rules file looks like
 
-### Conflict detection
-New auto-learned rules are checked against your hand-written `CLAUDE.md`. Conflicts become alerts — your rules are never overwritten.
-
-## Installation
-
-### Quick setup (recommended)
-
-```bash
-git clone https://github.com/jack60810/claude-evolve.git
-cd claude-evolve
-node setup.js
-```
-
-That's it. The setup script automatically:
-- Detects your install path
-- Adds hooks to `~/.claude/settings.json` (merges with existing settings, never overwrites)
-- Creates the data directory
-- Verifies claude CLI and Node.js are available
-
-### Verify
-
-```bash
-node setup.js --check
-```
-
-### Uninstall
-
-```bash
-node setup.js --remove
-```
-
-Removes hooks from settings. Your learned rules in `CLAUDE.md` and data in `learning/data/` are preserved.
-
-<details>
-<summary>Manual setup (if you prefer editing JSON)</summary>
-
-Add these hooks to `~/.claude/settings.json`. If you already have hooks, merge the entries into the existing arrays.
-
-```json
-{
-  "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node /FULL/PATH/TO/claude-evolve/learning/hooks/session-start.js",
-            "timeout": 3
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node /FULL/PATH/TO/claude-evolve/learning/hooks/post-tool.js",
-            "timeout": 2
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node /FULL/PATH/TO/claude-evolve/learning/hooks/session-end.js",
-            "timeout": 8
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-Replace `/FULL/PATH/TO/claude-evolve` with the actual absolute path.
-
-</details>
-
-## What gets written to CLAUDE.md
-
-Auto-learned rules are placed in a fenced section. Your hand-written rules are never touched.
+Your hand-written text stays where it is. Only the block between the markers is claude-evolve's:
 
 ```markdown
-## Your Hand-Written Rules
+## Your hand-written rules
 
-These are yours. claude-evolve will never modify them.
-
+<!-- claude-evolve:managed-start -->
 ## Auto-learned Rules
 
-<!-- evolver:managed-start -->
-
-<!-- evolver:rule id=r_abc score=8 created=2026-04-17 source=correction -->
+<!-- claude-evolve:rule id=r_abc -->
 - Always check existing definitions before writing new queries
-<!-- /evolver:rule -->
+<!-- /claude-evolve:rule -->
 
-<!-- evolver:rule id=r_def score=7 created=2026-04-15 source=observation -->
-- After each Edit, run a validation step before moving to the next modification
-<!-- /evolver:rule -->
-
-<!-- evolver:rule id=r_ghi score=6 created=2026-04-16 source=anti_pattern -->
-- Always Read a file before Edit — blind edits cause errors
-<!-- /evolver:rule -->
-
-<!-- evolver:managed-end -->
+<!-- claude-evolve:managed-end -->
 ```
 
-## Pipeline: Signal → Gene → Execute → Validate → Solidify
+The tag holds only the rule's id. Scores and everything else live in `rules.json`, so a score change never rewrites the file.
 
-| Step | Model | What it does |
-|------|-------|-------------|
-| **Triage** | haiku | Determines gene + complexity from session data |
-| **Gene execute** | haiku or sonnet | Runs the selected gene's action |
-| **Validate** | keyword | Checks for conflicts with hand-written rules |
-| **Classify** | — | Determines output complexity level |
-| **Solidify** | — | Routes to CLAUDE.md or .claude/skills/ |
-| **Memory** | sonnet | Compresses session into persistent memory |
+## Tests
 
-### Genes
+```bash
+npm test
+```
 
-| Gene | Trigger | Action |
-|------|---------|--------|
-| `repair` | Corrections detected | Extract rules from feedback |
-| `innovate` | Significant observations, no corrections | Detect patterns + anti-patterns from timeline |
-| `optimize` | Periodic (every ~3 sessions) | LLM scores all rules 0-10, demotes low scorers |
-| `cleanup` | 8+ active rules | LLM merges, rewrites, or removes redundant rules |
-| `skillify` | 3+ related high-score rules | Promote rule group to .claude/skills/ file |
-| `observe` | Trivial session | Just record, no action |
-
-## How scoring works
-
-| Mechanism | Details |
-|-----------|---------|
-| **Scale** | 0-10, scored by LLM per session |
-| **Smoothing** | Exponential moving average (α=0.3) |
-| **New rules** | Start at 5 (neutral / untested) |
-| **Demotion** | Score < 3 after 3+ evaluations → dormant |
-| **Death** | 15 sessions in dormant → dead |
-
-## Three-tier session memory
-
-| Tier | Content | When used |
-|------|---------|-----------|
-| **1. Index** | One line per session in `index.md` | Injected at every session-start |
-| **2. Summary** | Bullet points + key decisions | On-demand (search/recall) |
-| **3. Full** | Complete tool observation timeline | Debugging / deep analysis |
+This runs `node --test test/*.test.js`. The tests mock the `claude` CLI and use temp folders, so they cost nothing and need no login. GitHub Actions runs them on Node 18, 20 and 22.
 
 ## Architecture
 
 ```
+setup.js                   install, check, remove, clean-stale
+demo.js                    the demo above
 learning/
 ├── hooks/
-│   ├── session-start.js   — Inject index + conflict alerts + skill hints + cross-project suggestions
-│   ├── session-end.js     — Collect observations + classify project type + spawn background
-│   └── post-tool.js       — Record full tool input/output
-├── processRules.js        — Signal → Gene → Execute → Classify → Route → Solidify
-├── llmBrain.js            — All LLM calls (triage, extraction, scoring, complexity, skill generation)
-├── ruleEngine.js          — Population lifecycle (active/dormant/dead) + complexity tracking
-├── claudeMdWriter.js      — CLAUDE.md managed section (simple/compound/workflow formats)
-├── skillWriter.js         — .claude/skills/ auto-generation via Claude sonnet
-├── memoryReader.js        — Read Claude Code memories (feedback/user/project/reference)
-├── sessionMemory.js       — Three-tier session memory (index/summary/full)
-├── exploration.js         — Manual: stale rule and drift detection
-├── analyzer.js            — Session statistics + project type classification
-├── genes.json             — Gene definitions (repair/innovate/optimize/cleanup/skillify/observe)
-└── setup.js               — One-command install/check/uninstall
+│   ├── session-start.js   sweep abandoned sessions, inject context
+│   ├── post-tool.js       record redacted tool calls
+│   └── session-end.js     claim the session, spawn the processor
+├── processRules.js        the pipeline: triage, gene, check, apply, solidify
+├── llmBrain.js            every claude --print call, with tiers and retry
+├── ruleEngine.js          rule store, scoring, lifecycle
+├── claudeMdWriter.js      the managed block in CLAUDE.local.md
+├── skillWriter.js         .claude/skills/auto-*/SKILL.md
+├── sessionMemory.js       session files, per-project index, temp observation files
+├── memoryReader.js        reads your Claude Code memories
+├── crossProjectStore.js   patterns shared between projects of one type
+├── skillHints.js          one-time "a skill was created" notices
+├── cleanStale.js          behind setup.js --clean-stale
+├── analyzer.js            session stats and project type
+├── redact.js              secret redaction
+├── paths.js               data dir and project-folder resolution
+├── fsutil.js              atomic writes, locks, bounded logs
+├── exploration.js         manual: node learning/exploration.js [path] reports stale rules and drift
+├── bootstrap.js           manual: node learning/bootstrap.js seeds a profile from your memories
+└── genes.json             gene definitions
 ```
 
-## Requirements
+## Origin story
 
-- [Claude Code](https://claude.com/claude-code) CLI
-- Node.js >= 18
-- No npm dependencies (zero install, just clone and run)
+This project was inspired by [Evolver](https://github.com/EvoMap/evolver) by the EvoMap team. Evolver is a GEP (Gene Expression Programming) engine that lets AI agents evolve their own code.
+
+I wanted to use Evolver as it is, then realized I didn't need a full autonomous self-evolution agent. I needed something simpler: Claude Code that gets better at working with me, session after session. So I took the core ideas (signal detection, gene-based actions, LLM evaluation, solidification) and pointed them at how a human works instead of at code. The "genome" isn't source code. It's each project's rules file.
 
 ## Acknowledgments
 
-- [Evolver / EvoMap](https://github.com/EvoMap/evolver) — the original evolver engine that inspired this project's signal-gene-solidify architecture
-- [Claude Code](https://claude.com/claude-code) by Anthropic — the AI coding assistant this system is built for
+- [Evolver / EvoMap](https://github.com/EvoMap/evolver) for the signal, gene and solidify architecture this project borrows from.
+- [Claude Code](https://claude.com/claude-code) by Anthropic, the assistant this is built for.
 
 ## License
 

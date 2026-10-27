@@ -1,29 +1,40 @@
 #!/usr/bin/env node
-// processRules.js — Signal-gene learning pipeline
+// processRules.js — Signal-gene learning pipeline (one detached run per session)
 //
-// Signal → Gene → LLM Execute → Validate → Solidify
+// Signal → Gene → LLM Execute → Check → Apply → Solidify
 //
 // Signal: What happened in this session? (corrections, observations, quiet)
 // Gene: What action to take? (repair / innovate / optimize / cleanup / skillify)
 //   - repair:   corrections detected → extract new rules from feedback
 //   - innovate: patterns/anti-patterns detected → extract rules from observations
-//   - optimize: LLM evaluates all active rules, scores them, demotes bad ones
+//   - optimize: LLM evaluates all active rules, scores them, may revive dormant ones
 //   - cleanup:  too many rules → LLM merges and simplifies
-//   - skillify: 3+ related high-score rules → re-classify complexity, promote to skill files
-// Execute: LLM performs the gene's action
-// Validate: LLM checks the resulting rule set for conflicts and consistency
-// Solidify: Write to CLAUDE.md + session memory
+//   - skillify: 3+ mature rules → promote to methodology, written as a skill
+// Execute: LLM performs the gene's action against a snapshot of the store (no lock held)
+// Check: every new, merged, rewritten or revived rule is checked against all instruction
+//   layers and the user's memories; those always win (conflict → rule goes dormant)
+// Apply: one locked mutation re-reads the store and applies everything, then scores,
+//   dedupes and runs the lifecycle (decay, promotion, TTL pruning)
+// Solidify: skill files, the project's rules file, session memory, run log
+//
+// Usage: node processRules.js <pending_file>. Pending files older than a day (an earlier
+// processor died) are swept and processed first.
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
+const { DATA_DIR, resolveProjectRoot, realpathOr } = require('./paths');
+const { appendBounded, writeJsonAtomic, readJson } = require('./fsutil');
 
-const DATA_DIR = path.join(__dirname, 'data');
 const PENDING_PATH = path.join(DATA_DIR, 'pending.json');
 const PROCESS_LOG = path.join(DATA_DIR, 'process.log');
+const RUNS_LOG = path.join(DATA_DIR, 'runs.jsonl');
+const SWEEP_AGE_MS = 24 * 60 * 60 * 1000;       // older than this: its processor died, retry it
+const STALE_PENDING_MS = 7 * 24 * 60 * 60 * 1000; // older than this: too old to apply, delete it
+const MAX_ATTEMPTS = 3;
 
 function log(msg) {
-  const line = `[${new Date().toISOString()}] ${msg}\n`;
-  try { fs.appendFileSync(PROCESS_LOG, line, 'utf8'); } catch {}
+  try { appendBounded(PROCESS_LOG, `[${new Date().toISOString()}] ${msg}`, 2 * 1024 * 1024); } catch {}
 }
 
 // =====================================================================
@@ -33,8 +44,7 @@ function log(msg) {
 function fallbackTriage(newMemories, observations, activeRuleCount, sessionCount, highScoreGroups) {
   let gene = 'observe';
   if ((newMemories || []).length > 0) gene = 'repair';
-  else if ((observations || []).length >= 3 && activeRuleCount === 0) gene = 'innovate'; // Fix 2: learn from session 1
-  else if ((observations || []).length >= 3) gene = 'innovate'; // Fix 2: lower threshold from 5 to 3
+  else if ((observations || []).length >= 3) gene = 'innovate';
   else if ((highScoreGroups || 0) > 0) gene = 'skillify';
   else if (activeRuleCount >= 8) gene = 'cleanup';
   else if (sessionCount > 0 && sessionCount % 3 === 0) gene = 'optimize';
@@ -42,515 +52,584 @@ function fallbackTriage(newMemories, observations, activeRuleCount, sessionCount
 }
 
 // =====================================================================
-// GENE EXECUTION (LLM calls)
+// PENDING FILES
 // =====================================================================
 
-async function main() {
-  const pendingFile = process.argv[2] || PENDING_PATH;
-  log('processRules started');
+/**
+ * Normalize a pending record. Old format (no cwd): project was the launch cwd.
+ * Returns null when the session has no project root (nothing may be written).
+ */
+function normalizePending(pending) {
+  if (!pending || !pending.project) return null;
+  if (!pending.cwd) {
+    pending.cwd = pending.project;
+    pending.project = resolveProjectRoot(pending.project).root;
+  }
+  return pending.project ? pending : null;
+}
 
+/**
+ * Pending files left behind by processors that died: 1 to 7 days old → claim and retry;
+ * older than 7 days → delete without processing (an old session must not rewrite rules now).
+ */
+function sweepPending(currentFile) {
+  let names = [];
+  try { names = fs.readdirSync(DATA_DIR); } catch { return; }
+  const now = Date.now();
+  for (const name of names) {
+    // pending_<id>.json, or a claim (<name>.<pid>.processing) whose processor died
+    const m = name.match(/^(pending_.+\.json)(\.\d+\.processing)?$/);
+    if (!m) continue;
+    const file = path.join(DATA_DIR, name);
+    const original = path.join(DATA_DIR, m[1]);
+    if (path.resolve(file) === path.resolve(currentFile || '')) continue;
+    try {
+      const age = now - fs.statSync(file).mtimeMs;
+      if (age < SWEEP_AGE_MS) continue;
+      if (age > STALE_PENDING_MS) {
+        fs.unlinkSync(file);
+        log(`Sweep: ${name} is ${Math.floor(age / 86400000)} days old; deleted without processing`);
+        continue;
+      }
+      const claimed = `${original}.${process.pid}.processing`;
+      fs.renameSync(file, claimed);  // whoever renames first owns it
+      fs.utimesSync(claimed, new Date(), new Date());  // a fresh claim is not stale to others
+      log(`Sweep: ${name}`);
+      processFile(claimed, original);
+    } catch (err) {
+      if (err.code !== 'ENOENT') log(`Sweep error for ${name}: ${err.message}`);
+    }
+  }
+}
+
+/**
+ * Process one pending file. On success (or invalid input) the file is deleted. On failure it
+ * is put back with attempts+1 for a later sweep; after MAX_ATTEMPTS it is deleted.
+ */
+function processFile(file, restorePath) {
   let pending;
   try {
-    pending = JSON.parse(fs.readFileSync(pendingFile, 'utf8'));
+    pending = normalizePending(readJson(file, null));
   } catch (err) {
-    log('No pending data: ' + (err.message || err));
+    log(`Invalid pending ${path.basename(file)}: ${err.message}`);
+  }
+  if (!pending) {
+    log(`Pending ${path.basename(restorePath || file)} has no project root; deleted`);
+    try { fs.unlinkSync(file); } catch {}
     return;
   }
-  if (!pending || !pending.project) { log('Invalid pending'); return; }
 
-  const { project, newMemories, observations, handWrittenContent } = pending;
-  log(`Project: ${path.basename(project)}, memories: ${(newMemories || []).length}, obs: ${(observations || []).length}`);
+  try {
+    processPending(pending, file);
+    try { fs.unlinkSync(file); } catch {}
+  } catch (err) {
+    const attempts = (pending.attempts || 0) + 1;
+    log(`FATAL (attempt ${attempts}/${MAX_ATTEMPTS}): ${err.stack || err.message || err}`);
+    try {
+      if (attempts >= MAX_ATTEMPTS) {
+        fs.unlinkSync(file);
+      } else {
+        writeJsonAtomic(restorePath || file, { ...pending, attempts });
+        if (restorePath && restorePath !== file) fs.unlinkSync(file);
+      }
+    } catch {}
+  }
+}
 
+// =====================================================================
+// INSTRUCTION LAYERS (what Claude Code loads for this project)
+// =====================================================================
+
+function readHandWritten(file, claudeMdWriter) {
+  try { return claudeMdWriter.getHandWrittenContent(fs.readFileSync(file, 'utf8')); } catch { return ''; }
+}
+
+/**
+ * Hand-written instruction files for the root, any between the launch cwd and the root,
+ * every CLAUDE.md / CLAUDE.local.md from the root's parent upward, ~/.claude/CLAUDE.md,
+ * and the user's memories for the launch cwd.
+ */
+function collectInstructionLayers(root, cwd, excludeMemoryFiles) {
+  const claudeMdWriter = require('./claudeMdWriter');
+  const layers = [];
+  const addDir = (dir, where) => {
+    for (const name of claudeMdWriter.INSTRUCTION_FILES) {
+      const file = path.join(dir, name);
+      const text = readHandWritten(file, claudeMdWriter);
+      if (text) layers.push({ label: `${file} (${where})`, text });
+    }
+  };
+
+  addDir(root, 'project root');
+  // Subdirectories between the launch cwd and the root
+  let dir = cwd ? realpathOr(cwd) : root;
+  const inside = [];
+  while (dir.startsWith(root + path.sep)) { inside.push(dir); dir = path.dirname(dir); }
+  for (const d of inside.reverse()) addDir(d, 'project subdirectory');
+  // Parents of the root, up to /
+  for (let d = path.dirname(root); ; d = path.dirname(d)) {
+    addDir(d, 'parent directory');
+    if (path.dirname(d) === d) break;
+  }
+
+  const userMd = path.join(os.homedir(), '.claude', 'CLAUDE.md');
+  const userText = readHandWritten(userMd, claudeMdWriter);
+  if (userText) layers.push({ label: '~/.claude/CLAUDE.md (user global)', text: userText });
+
+  let memories = [];
+  try { memories = require('./memoryReader').getAllMemories(cwd || root) || []; } catch {}
+  // The session's own correction memories are the source of repair rules, not a check against them
+  const skip = new Set(['MEMORY.md', ...(excludeMemoryFiles || [])]);
+  const memText = memories
+    .filter(m => !skip.has(m.file))
+    .map(m => `- [${m.type || 'memory'}] ${m.name || m.file}: ${m.description || ''} ${String(m.content || '').replace(/\s+/g, ' ').slice(0, 400)}`.trim())
+    .join('\n');
+  if (memText) layers.push({ label: 'user memories', text: memText });
+
+  return { layers, memories };
+}
+
+// =====================================================================
+// MAIN PIPELINE
+// =====================================================================
+
+function isDir(p) {
+  try { return fs.statSync(p).isDirectory(); } catch { return false; }
+}
+
+/**
+ * Run one session through the pipeline. `file` is the pending file being processed: once the
+ * learning has been applied to the store it is marked `applied`, so a retry after a later
+ * failure only redoes the writes (the session is never counted or scored twice).
+ */
+function processPending(pending, file) {
+  const started = Date.now();
+  const { project, cwd, newMemories = [], observations = [] } = pending;
   const ruleEngine = require('./ruleEngine');
   const claudeMdWriter = require('./claudeMdWriter');
   const llmBrain = require('./llmBrain');
+  llmBrain.resetStats();
+  log(`processRules started: ${path.basename(project)}, memories: ${newMemories.length}, obs: ${observations.length}`);
 
-  const sessionCount = ruleEngine.incrementSession(project);
-  const activeRules = ruleEngine.getActiveRules(project);
+  // A deleted worktree or workspace stays deleted: nothing is learned or written for it
+  if (!isDir(project)) {
+    log(`Skip: project ${project} no longer exists; nothing written`);
+    return { skipped: 'project missing' };
+  }
+
+  const migrated = ruleEngine.migrateStore();
+  if (migrated) log(`Store migrated to v${ruleEngine.SCHEMA_VERSION}: ${JSON.stringify(migrated)}`);
+
+  let learned;
+  let memories;
+  const isRetry = !!pending.applied;
+  if (isRetry) {
+    learned = pending.applied;
+    memories = collectInstructionLayers(project, cwd, newMemories.map(m => m.file).filter(Boolean)).memories;
+    log(`Retry: learning was applied at ${learned.at}; redoing the writes only`);
+  } else {
+    ({ learned, memories } = learnAndApply(pending, ruleEngine, llmBrain));
+    pending.applied = learned;
+    if (file) writeJsonAtomic(file, pending);
+  }
+  const { gene, complexity, sessionCount, rulesBorn, conflicts, prunedCount } = learned;
+  const changed = new Set(learned.changedIds || []);
+
+  solidify(pending, learned, memories, ruleEngine, claudeMdWriter, llmBrain, changed);
+
+  // --- Run record ---
+  const finalStats = ruleEngine.getPopulationStats(project);
+  const llm = llmBrain.getStats();
+  ruleEngine.logChange({
+    action: 'session_complete', project, gene, complexity, session: sessionCount,
+    rules_born: rulesBorn, conflicts, population: finalStats, retry: isRetry,
+  });
+  try {
+    appendBounded(RUNS_LOG, JSON.stringify({
+      time: new Date().toISOString(), project, sessionId: pending.sessionId || null, gene,
+      llmCalls: llm.calls, llmFailures: llm.failures, llmFailureKinds: llm.kinds,
+      rulesBorn, durationMs: Date.now() - started,
+    }), 1024 * 1024);
+  } catch {}
+
+  const summary = `session=${sessionCount} born=${rulesBorn} active=${finalStats.active} dormant=${finalStats.dormant}`;
+  if (llm.failures === 0) {
+    log(`Done [${gene}]: ${summary}`);
+  } else {
+    const kinds = Object.entries(llm.kinds).map(([k, n]) => `${k}×${n}`).join(', ');
+    log(`Done with ${llm.failures} LLM failures (${kinds}) [${gene}]: ${summary}`);
+  }
+  return { gene, rulesBorn, llm, prunedCount };
+}
+
+/**
+ * Triage, execute the gene (LLM, no lock), check, and apply everything to the store in one
+ * locked mutation. Returns { learned, memories }; `learned` is what the writes need and what
+ * the pending file keeps as its `applied` marker.
+ */
+function learnAndApply(pending, ruleEngine, llmBrain) {
+  const { project, cwd, newMemories = [], observations = [] } = pending;
+  const sessionCount = ruleEngine.incrementSession();
+  const snapshot = ruleEngine.getActiveRules(project);
   const stats = ruleEngine.getPopulationStats(project);
-  log(`Session #${sessionCount} | active=${stats.active} dormant=${stats.dormant} dead=${stats.dead}`);
+  log(`Session #${sessionCount} | active=${stats.active} candidate=${stats.candidate} dormant=${stats.dormant}`);
 
-  // --- Count high-score rules for skillify (group by project type, not keyword) ---
-  const highScoreRules = activeRules.filter(r => (r.score || 0) > 7 && (r.relevance_count || 0) >= 5);
-  const highScoreGroups = highScoreRules.length >= 3 ? 1 : 0;
+  const { layers, memories } = collectInstructionLayers(project, cwd, newMemories.map(m => m.file).filter(Boolean));
+  const layerTexts = layers.map(l => l.text).join('\n');
+  const handContext = llmBrain.budgetLayers(layers, 4000);
+
+  // --- Count high-score rules for skillify ---
+  const isMature = r => (r.score || 0) > 7 && (r.relevance_count || 0) >= 5;
+  const highScoreGroups = snapshot.filter(isMature).length >= 3 ? 1 : 0;
 
   // --- Triage: LLM decides gene + complexity ---
   let gene = 'observe';
   let complexity = 'routine';
-  try {
-    const triageResult = llmBrain.triage(observations, newMemories, stats.active, sessionCount, highScoreGroups);
-    if (triageResult && triageResult.gene) {
-      gene = triageResult.gene;
-      complexity = triageResult.complexity || 'routine';
-      log(`Triage (LLM): gene=${gene} complexity=${complexity} — ${triageResult.reason || ''}`);
-    } else {
-      const fb = fallbackTriage(newMemories, observations, stats.active, sessionCount, highScoreGroups);
-      gene = fb.gene; complexity = fb.complexity;
-      log(`Triage (fallback): gene=${gene}`);
-    }
-  } catch (err) {
+  const triageResult = llmBrain.triage(observations, newMemories, stats.active, sessionCount, highScoreGroups);
+  if (triageResult && triageResult.gene) {
+    gene = triageResult.gene;
+    complexity = triageResult.complexity === 'complex' ? 'complex' : 'routine';
+    log(`Triage (LLM): gene=${gene} complexity=${complexity} — ${triageResult.reason || ''}`);
+  } else {
     const fb = fallbackTriage(newMemories, observations, stats.active, sessionCount, highScoreGroups);
     gene = fb.gene; complexity = fb.complexity;
-    log(`Triage error, using fallback: gene=${gene} — ${err.message || err}`);
+    log(`Triage (fallback): gene=${gene}`);
   }
 
   // Model tier for gene execution: routine → haiku, complex → sonnet
   const tier = complexity === 'complex' ? 'smart' : 'fast';
   log(`Model tier: ${tier} (${complexity})`);
 
-  let rulesAdded = 0;
-  let conflictsFound = 0;
-  const sessionRuleIds = new Set(); // Track rule IDs born/modified this session
+  // ================= Execute (LLM, no lock) =================
+  const proposals = [];  // { content, keywords, source }
+  const proposeFromObservations = (result, label) => {
+    if (!result) return;
+    for (const [list, source] of [[result.patterns, 'observation'], [result.anti_patterns, 'anti_pattern']]) {
+      for (const p of list || []) {
+        if (!p || !p.rule || p.confidence === 'low') continue;
+        proposals.push({ content: String(p.rule), keywords: Array.isArray(p.keywords) ? p.keywords : [], source });
+      }
+    }
+    log(`  ${label}: ${proposals.length} proposal(s)`);
+  };
 
-  // --- Execute gene ---
+  let evaluations = null;
+  let reviveIds = [];
+  let cleanupActions = [];
+  const promotions = [];  // { id, complexity }
+
   if (gene === 'repair') {
-    // Extract rules from corrections
-    for (const mem of (newMemories || [])) {
-      try {
-        const extracted = llmBrain.extractRule(mem);
-        if (!extracted || !extracted.rule) continue;
-
-        const ruleContent = extracted.rule;
-        const keywords = extracted.keywords || [];
-        log(`  Extracted: "${ruleContent.slice(0, 80)}"`);
-
-        if (ruleEngine.isDuplicate(project, keywords)) { log('  Skip (dup)'); continue; }
-
-        // Conflict check
-        const conflict = llmBrain.checkConflict(ruleContent, handWrittenContent || '');
-        if (conflict && conflict.decision === 'duplicate') { log('  Skip (dup of hand-written)'); continue; }
-        if (conflict && conflict.decision === 'conflict') {
-          ruleEngine.addConflict(project, ruleContent, conflict.conflicts_with || '', 1.0);
-          conflictsFound++;
-          log('  Conflict saved');
-          continue;
-        }
-
-        const added = ruleEngine.addRule(project, ruleContent, 'correction', keywords, 'active');
-        sessionRuleIds.add(added.id);
-        rulesAdded++;
-        log(`  Added [correction]: "${ruleContent.slice(0, 60)}"`);
-      } catch (err) { log(`  Error: ${err.message}`); }
-    }
-
-    // Also extract from observations during repair if population is small
-    if (stats.active < 3 && observations && observations.length >= 3) {
-      try {
-        const obsResult = llmBrain.analyzeObservations(observations, ruleEngine.getActiveRules(project), handWrittenContent);
-        if (obsResult) {
-          for (const p of [...(obsResult.patterns || []), ...(obsResult.anti_patterns || [])]) {
-            if (!p.rule || p.confidence === 'low') continue;
-            if (ruleEngine.isDuplicate(project, p.keywords || [])) continue;
-            const src = (obsResult.anti_patterns || []).includes(p) ? 'anti_pattern' : 'observation';
-            const added = ruleEngine.addRule(project, p.rule, src, p.keywords, 'active');
-            sessionRuleIds.add(added.id);
-            rulesAdded++;
-            log(`  Added [${src}]: "${p.rule.slice(0, 60)}"`);
-          }
-        }
-      } catch (err) { log(`  Observation error: ${err.message}`); }
-    }
-  }
-
-  if (gene === 'innovate') {
-    // Extract patterns and anti-patterns from observations
-    if (observations && observations.length >= 3) {
-      try {
-        log('Analyzing observations for patterns...');
-        const obsResult = llmBrain.analyzeObservations(observations, activeRules, handWrittenContent);
-        if (obsResult) {
-          for (const p of (obsResult.patterns || [])) {
-            if (!p.rule || p.confidence === 'low') continue;
-            if (ruleEngine.isDuplicate(project, p.keywords || [])) continue;
-            const status = stats.active < ruleEngine.MAX_ACTIVE ? 'active' : 'candidate';
-            const added = ruleEngine.addRule(project, p.rule, 'observation', p.keywords, status);
-            sessionRuleIds.add(added.id);
-            rulesAdded++;
-            log(`  Added [observation] as ${status}: "${p.rule.slice(0, 60)}"`);
-          }
-          for (const p of (obsResult.anti_patterns || [])) {
-            if (!p.rule || p.confidence === 'low') continue;
-            if (ruleEngine.isDuplicate(project, p.keywords || [])) continue;
-            const status = stats.active < ruleEngine.MAX_ACTIVE ? 'active' : 'candidate';
-            const added = ruleEngine.addRule(project, p.rule, 'anti_pattern', p.keywords, status);
-            sessionRuleIds.add(added.id);
-            rulesAdded++;
-            log(`  Added [anti_pattern] as ${status}: "${p.rule.slice(0, 60)}"`);
-          }
-        }
-      } catch (err) { log(`  Innovation error: ${err.message}`); }
-    }
-  }
-
-  if (gene === 'optimize') {
-    // LLM evaluates all active rules: score 0-10, suggest changes
-    const currentActive = ruleEngine.getActiveRules(project);
-    if (currentActive.length > 0) {
-      try {
-        log(`Optimizing ${currentActive.length} active rules...`);
-        const evalResult = llmBrain.evaluateRuleSet(currentActive, observations, newMemories);
-
-        if (evalResult && Array.isArray(evalResult.evaluations)) {
-          const changes = ruleEngine.applyScores(project, evalResult.evaluations);
-          for (const c of changes) {
-            log(`  ${c.rule_id.slice(0, 12)}: ${c.old_score} → ${c.new_score} (LLM: ${c.llm_score}) ${c.reason}`);
-          }
-
-          // Re-evaluate complexity for rules whose score just crossed the >7 threshold
-          for (const change of changes) {
-            if (change.new_score > 7 && change.old_score <= 7) {
-              const rule = currentActive.find(r => r.id === change.rule_id);
-              if (rule && (rule.relevance_count || 0) >= 5) {
-                const related = ruleEngine.getRelatedRules(project, rule, 0.2)
-                  .filter(r => (r.score || 0) > 7);
-                if (related.length >= 2) {
-                  try {
-                    const group = [rule, ...related];
-                    const newComplexity = llmBrain.classifyComplexity(
-                      { content: group.map(r => r.content).join('\n'), keywords: [...new Set(group.flatMap(r => r.keywords || []))] },
-                      currentActive,
-                      pending.projectType || ''
-                    );
-                    const levels = ['simple', 'compound', 'workflow', 'methodology'];
-                    const currentLevel = levels.indexOf(rule.complexity || 'simple');
-                    const newLevel = levels.indexOf(newComplexity);
-                    if (newLevel > currentLevel) {
-                      ruleEngine.updateComplexity(project, rule.id, newComplexity);
-                      sessionRuleIds.add(rule.id);
-                      log(`  Optimize-promote ${rule.id.slice(0,12)}: ${rule.complexity || 'simple'} → ${newComplexity}`);
-                    }
-                  } catch (err) {
-                    log(`  Optimize-promote error: ${err.message}`);
-                  }
-                }
-              }
-            }
-          }
-        }
-
-        // Apply lifecycle: demote low, promote candidates, kill old dormant
-        const lifecycle = ruleEngine.applyLifecycle(project, sessionCount);
-        if (lifecycle.demoted.length) log(`  Demoted: ${lifecycle.demoted.length}`);
-        if (lifecycle.promoted.length) log(`  Promoted: ${lifecycle.promoted.length}`);
-        if (lifecycle.killed.length) log(`  Killed: ${lifecycle.killed.length}`);
-
-        // Revive dormant rules if LLM suggests
-        if (evalResult && Array.isArray(evalResult.revive)) {
-          const data = ruleEngine.loadPopulation();
-          for (const id of evalResult.revive) {
-            const r = data.population.find(x => x.id === id && x.status === 'dormant');
-            if (r) {
-              r.status = 'active';
-              r.score = 5; // Reset to neutral
-              ruleEngine.logChange({ action: 'revived', rule_id: id, project });
-              log(`  Revived: ${r.content.slice(0, 40)}`);
-            }
-          }
-          ruleEngine.savePopulation(data);
-        }
-      } catch (err) { log(`  Optimize error: ${err.message}`); }
-    }
-  }
-
-  if (gene === 'cleanup') {
-    // LLM merges and simplifies the rule set
-    const currentActive = ruleEngine.getActiveRules(project);
-    if (currentActive.length >= 5) {
-      try {
-        log(`Cleaning up ${currentActive.length} rules...`);
-        const cleanResult = llmBrain.cleanupRules(currentActive);
-
-        if (cleanResult && Array.isArray(cleanResult.actions)) {
-          const data = ruleEngine.loadPopulation();
-          for (const action of cleanResult.actions) {
-            if (action.type === 'merge' && action.merged_rule && action.source_ids) {
-              // Demote sources, add merged
-              for (const id of action.source_ids) {
-                const r = data.population.find(x => x.id === id);
-                if (r) r.status = 'dormant';
-              }
-              ruleEngine.savePopulation(data);
-              const added = ruleEngine.addRule(project, action.merged_rule, 'cleanup', action.keywords, 'active');
-              sessionRuleIds.add(added.id);
-              log(`  Merged ${action.source_ids.length} → "${action.merged_rule.slice(0, 60)}"`);
-            }
-            if (action.type === 'rewrite' && action.rule_id && action.new_content) {
-              const r = data.population.find(x => x.id === action.rule_id);
-              if (r) {
-                r.content = action.new_content;
-                r.keywords = ruleEngine.extractKeywords(action.new_content);
-                sessionRuleIds.add(r.id); // Rewritten counts as modified
-                log(`  Rewritten: "${action.new_content.slice(0, 60)}"`);
-              }
-            }
-            if (action.type === 'remove' && action.rule_id) {
-              const r = data.population.find(x => x.id === action.rule_id);
-              if (r) { r.status = 'dormant'; log(`  Removed: "${r.content.slice(0, 40)}"`); }
-            }
-          }
-          ruleEngine.savePopulation(data);
-        }
-      } catch (err) { log(`  Cleanup error: ${err.message}`); }
-    }
-  }
-
-  if (gene === 'skillify') {
-    // P1: Group ALL high-score rules in this project as one methodology group.
-    // No keyword similarity needed — same project type = same methodology.
-    const currentActive = ruleEngine.getActiveRules(project);
-    const matureRules = currentActive.filter(r =>
-      (r.score || 0) > 7 && (r.relevance_count || 0) >= 5
-    );
-
-    if (matureRules.length >= 3) {
-      log(`  Skillify: ${matureRules.length} mature rules in project → methodology`);
-      const data = ruleEngine.loadPopulation();
-
-      for (const r of matureRules) {
-        const currentLevel = ['simple', 'compound', 'workflow', 'methodology'].indexOf(r.complexity || 'simple');
-        if (currentLevel < 3) { // not yet methodology
-          const popRule = data.population.find(x => x.id === r.id);
-          if (popRule) {
-            popRule.complexity = 'methodology';
-            sessionRuleIds.add(r.id);
-            log(`  Promoted ${r.id.slice(0,12)}: ${r.complexity || 'simple'} → methodology`);
-          }
-        }
+    for (const mem of newMemories) {
+      const extracted = llmBrain.extractRule(mem, tier);
+      if (extracted && extracted.rule) {
+        proposals.push({ content: String(extracted.rule), keywords: Array.isArray(extracted.keywords) ? extracted.keywords : [], source: 'correction' });
+        log(`  Extracted: "${String(extracted.rule).slice(0, 80)}"`);
       }
-      ruleEngine.savePopulation(data);
-    } else {
-      log(`  Skillify: only ${matureRules.length} mature rules (need 3+), skipping`);
+    }
+    // Also learn from observations while the population is small
+    if (stats.active < 3 && observations.length >= 3) {
+      proposeFromObservations(llmBrain.analyzeObservations(observations, snapshot, handContext, tier), 'Observations');
     }
   }
 
-  // --- Fix 4: Auto-dedup when rules pile up, regardless of which gene ran ---
-  if (gene !== 'cleanup') {
-    const postGeneActive = ruleEngine.getActiveRules(project);
-    if (postGeneActive.length >= 6) {
-      // Quick keyword-based dedup: if two rules share >50% keywords, demote the lower-scored one
-      const data = ruleEngine.loadPopulation();
-      let deduped = 0;
-      const seen = new Set();
-      for (let i = 0; i < postGeneActive.length; i++) {
-        if (seen.has(postGeneActive[i].id)) continue;
-        for (let j = i + 1; j < postGeneActive.length; j++) {
-          if (seen.has(postGeneActive[j].id)) continue;
-          const sim = ruleEngine.jaccardSimilarity(
-            postGeneActive[i].keywords || [], postGeneActive[j].keywords || []
-          );
-          if (sim > 0.5) {
-            // Demote the lower-scored duplicate
-            const loser = (postGeneActive[i].score || 0) >= (postGeneActive[j].score || 0)
-              ? postGeneActive[j] : postGeneActive[i];
-            const pop = data.population.find(x => x.id === loser.id);
-            if (pop && pop.status === 'active') {
-              pop.status = 'dormant';
-              pop.dormant_since_session = ruleEngine.loadPopulation().session_count || 0;
-              seen.add(loser.id);
-              deduped++;
-              log(`  Auto-dedup: demoted "${loser.content.slice(0, 40)}" (sim=${sim.toFixed(2)})`);
-            }
-          }
-        }
-      }
-      if (deduped > 0) ruleEngine.savePopulation(data);
-    }
+  if (gene === 'innovate' && observations.length >= 3) {
+    log('Analyzing observations for patterns...');
+    proposeFromObservations(llmBrain.analyzeObservations(observations, snapshot, handContext, tier), 'Innovate');
   }
 
-  // gene === 'observe' → no LLM calls, just record
-
-  // --- Validate (only if we changed something) ---
-  if (rulesAdded > 0 || gene === 'optimize' || gene === 'cleanup' || gene === 'skillify') {
-    // Quick validation: check the final active set isn't self-contradictory
-    const finalActive = ruleEngine.getActiveRules(project);
-    if (finalActive.length > 0 && handWrittenContent) {
-      for (const rule of finalActive) {
-        const conflict = ruleEngine.detectConflict(rule.content, handWrittenContent);
-        if (conflict.hasConflict) {
-          log(`  Validate: conflict detected for ${rule.id}, demoting`);
-          const data = ruleEngine.loadPopulation();
-          const r = data.population.find(x => x.id === rule.id);
-          if (r) {
-            r.status = 'dormant';
-            ruleEngine.addConflict(project, rule.content, conflict.conflictsWith, conflict.similarity);
-          }
-          ruleEngine.savePopulation(data);
+  if (gene === 'optimize' && snapshot.length > 0) {
+    log(`Optimizing ${snapshot.length} active rules...`);
+    const evalResult = llmBrain.evaluateRuleSet(snapshot, observations, newMemories, tier);
+    if (evalResult && Array.isArray(evalResult.evaluations)) {
+      evaluations = evalResult.evaluations;
+      // Rules whose score is about to cross 7 may graduate to a higher complexity level
+      for (const ev of evaluations) {
+        const rule = snapshot.find(r => r.id === ev.rule_id);
+        if (!rule || typeof ev.score !== 'number') continue;
+        const next = parseFloat((rule.score * 0.7 + ev.score * 0.3).toFixed(1));
+        if (!(next > 7 && rule.score <= 7 && (rule.relevance_count || 0) >= 5)) continue;
+        const related = ruleEngine.getRelatedRules(project, rule, 0.2).filter(r => r.status === 'active' && (r.score || 0) > 7);
+        if (related.length < 2) continue;
+        const group = [rule, ...related];
+        const newComplexity = llmBrain.classifyComplexity(
+          { content: group.map(r => r.content).join('\n'), keywords: [...new Set(group.flatMap(r => r.keywords || []))] },
+          snapshot, pending.projectType || '');
+        const levels = ['simple', 'compound', 'workflow', 'methodology'];
+        if (levels.indexOf(newComplexity) > levels.indexOf(rule.complexity || 'simple')) {
+          promotions.push({ id: rule.id, complexity: newComplexity });
         }
       }
     }
+    if (evalResult && Array.isArray(evalResult.revive)) reviveIds = evalResult.revive;
   }
 
-  // --- P2 fix: Heuristic scoring every session (no LLM call, no timeout risk) ---
-  // For each active rule, check if any observation's input/output contains rule keywords.
-  // If keywords appear in this session's observations → score up. If absent → neutral.
-  // This is fast (pure JS, no LLM) and ensures scores accumulate naturally.
-  if (observations && observations.length >= 3) {
-    const scorableRules = ruleEngine.getActiveRules(project);
-    if (scorableRules.length > 0) {
-      const obsText = observations.map(o => `${o.input || ''} ${o.output || ''}`).join(' ').toLowerCase();
-      const data = ruleEngine.loadPopulation();
-      let scored = 0;
+  if (gene === 'cleanup' && snapshot.length >= 5) {
+    log(`Cleaning up ${snapshot.length} rules...`);
+    const cleanResult = llmBrain.cleanupRules(snapshot, tier);
+    if (cleanResult && Array.isArray(cleanResult.actions)) cleanupActions = cleanResult.actions;
+  }
 
-      for (const rule of scorableRules) {
-        const pop = data.population.find(x => x.id === rule.id);
-        if (!pop) continue;
+  // ================= Check (dedupe, then one LLM contradiction check) =================
+  const dormantById = new Map(ruleEngine.getDormant(project).map(r => [r.id, r]));
+  const items = [];  // { kind: 'new'|'merge'|'rewrite'|'revive', content, keywords, ... }
+  for (const p of proposals) {
+    if (ruleEngine.isDuplicate(project, p.keywords.length ? p.keywords : ruleEngine.extractKeywords(p.content))) { log(`  Skip (dup of rule): "${p.content.slice(0, 50)}"`); continue; }
+    if (items.some(i => ruleEngine.jaccardSimilarity(ruleEngine.extractKeywords(i.content), ruleEngine.extractKeywords(p.content)) > 0.5)) continue;
+    const similar = ruleEngine.findSimilarChunk(p.content, layerTexts);
+    if (similar.duplicate) { log(`  Skip (already in instructions, sim=${similar.similarity}): "${p.content.slice(0, 50)}"`); continue; }
+    items.push({ kind: 'new', ...p });
+  }
+  for (const a of cleanupActions) {
+    if (a.type === 'merge' && a.merged_rule && Array.isArray(a.source_ids)) {
+      items.push({ kind: 'merge', content: String(a.merged_rule), keywords: Array.isArray(a.keywords) ? a.keywords : [], source: 'cleanup', sourceIds: a.source_ids });
+    } else if (a.type === 'rewrite' && a.rule_id && a.new_content) {
+      items.push({ kind: 'rewrite', content: String(a.new_content), ruleId: a.rule_id });
+    }
+  }
+  for (const id of reviveIds) {
+    const r = dormantById.get(id);
+    if (r) items.push({ kind: 'revive', content: r.content, ruleId: id });
+  }
 
-        // Count how many of the rule's keywords appear in session observations
-        const kw = (rule.keywords || []);
-        const hits = kw.filter(k => obsText.includes(k.toLowerCase())).length;
-        const hitRatio = kw.length > 0 ? hits / kw.length : 0;
-
-        // Score: 8 if strong match (>60% keywords), 6 if partial (>30%), 5 if no match
-        let sessionScore = 5;
-        if (hitRatio > 0.6) sessionScore = 8;
-        else if (hitRatio > 0.3) sessionScore = 6;
-
-        // EMA: 30% new, 70% old
-        const alpha = 0.3;
-        const oldScore = pop.score || 5;
-        pop.score = parseFloat((oldScore * (1 - alpha) + sessionScore * alpha).toFixed(1));
-        pop.relevance_count = (pop.relevance_count || 0) + 1;
-        pop.sessions_evaluated = (pop.sessions_evaluated || 0) + 1;
-
-        if (Math.abs(pop.score - oldScore) > 0.2) scored++;
+  let checked = [];
+  if (items.length > 0) {
+    const verdicts = llmBrain.checkContradictions(items.map(i => i.content), layers, tier);
+    const byIndex = new Map(((verdicts && verdicts.results) || []).map(v => [Number(v.index), v]));
+    for (let i = 0; i < items.length; i++) {
+      const v = byIndex.get(i);
+      if (!v || !['new', 'duplicate', 'conflict'].includes(v.decision)) {
+        log(`  Skip (contradiction check failed): "${items[i].content.slice(0, 50)}"`);
+        continue;
       }
-
-      ruleEngine.savePopulation(data);
-      if (scored > 0) log(`Heuristic-score: ${scored} rules updated`);
+      checked.push({ ...items[i], verdict: v });
+      log(`  Check [${v.decision}] ${items[i].kind}: "${items[i].content.slice(0, 50)}"${v.decision === 'new' ? '' : ` — ${String(v.reason || '').slice(0, 100)}`}`);
     }
   }
 
-  // --- Solidify: classify complexity + route output ---
+  // Complexity for rules that will be born active (and existing unclassified ones)
+  const unclassified = snapshot.filter(r => r.classified === false);
+  for (const item of checked) {
+    if ((item.kind === 'new' || item.kind === 'merge') && item.verdict.decision === 'new') {
+      item.complexity = llmBrain.classifyComplexity({ content: item.content, keywords: item.keywords }, snapshot, pending.projectType || '');
+    }
+  }
+  const classifications = unclassified.map(r => ({ id: r.id, complexity: llmBrain.classifyComplexity(r, snapshot, pending.projectType || '') }));
+
+  // ================= Apply (one locked mutation on a fresh store) =================
+  const observationText = observations.map(o => `${o.input || ''} ${o.output || ''}`).join(' ');
+  const changed = new Set();
+  const applied = ruleEngine.mutatePopulation(data => {
+    const res = { born: [], conflicts: 0, scored: 0, deduped: 0 };
+    const live = id => data.population.find(r => r.id === id && r.project === project);
+    const isLiveDup = kw => data.population.some(r => r.project === project &&
+      (r.status === 'active' || r.status === 'candidate') && ruleEngine.jaccardSimilarity(r.keywords || [], kw) > 0.5);
+
+    for (const item of checked) {
+      const { decision, reason = '', conflicts_with: withText = '', layer = '' } = item.verdict;
+      if (decision === 'duplicate') { log(`  Skip (duplicate per LLM): "${item.content.slice(0, 50)}" — ${reason}`); continue; }
+      if (decision === 'conflict') {
+        res.conflicts++;
+        const why = `conflicts with ${layer || 'instructions'}: ${String(withText || reason).slice(0, 160)}`;
+        ruleEngine.logChange({ action: 'conflict_auto_resolved', project, kind: item.kind, resolution: 'kept_existing', reason: why, content: item.content.slice(0, 200) });
+        if (item.kind === 'new') res.born.push(ruleEngine.insertRule(data, project, item.content, item.source, item.keywords, 'dormant', null, why));
+        if (item.kind === 'rewrite' || item.kind === 'revive') {
+          const r = live(item.ruleId);
+          if (r && item.kind === 'revive') r.status_reason = why;
+        }
+        log(`  Conflict auto-resolved (instructions win): "${item.content.slice(0, 50)}"`);
+        continue;
+      }
+
+      if (item.kind === 'new') {
+        const kw = item.keywords.length ? item.keywords : ruleEngine.extractKeywords(item.content);
+        if (isLiveDup(kw)) continue;  // a concurrent processor learned it meanwhile
+        const rule = ruleEngine.insertRule(data, project, item.content, item.source, kw, 'active', item.complexity);
+        res.born.push(rule);
+        changed.add(rule.id);
+        log(`  Added [${item.source}] as ${rule.status}: "${item.content.slice(0, 60)}"`);
+      } else if (item.kind === 'merge') {
+        const sources = item.sourceIds.map(live).filter(r => r && r.status === 'active');
+        if (sources.length < 2) continue;
+        // Sources leave first so the merged rule gets a slot; all in this one saved population
+        for (const r of sources) ruleEngine.setStatus(r, 'dormant', 'merged by cleanup');
+        const merged = ruleEngine.insertRule(data, project, item.content, 'cleanup', item.keywords, 'active', item.complexity);
+        for (const r of sources) r.status_reason = `merged into ${merged.id}`;
+        res.born.push(merged);
+        changed.add(merged.id);
+        log(`  Merged ${sources.length} → "${item.content.slice(0, 60)}"`);
+      } else if (item.kind === 'rewrite') {
+        const r = live(item.ruleId);
+        if (!r || r.status !== 'active') continue;
+        r.content = item.content;
+        r.keywords = ruleEngine.extractKeywords(item.content);
+        r.content_hash = require('crypto').createHash('sha256').update(item.content).digest('hex');
+        changed.add(r.id);
+        log(`  Rewritten: "${item.content.slice(0, 60)}"`);
+      } else if (item.kind === 'revive') {
+        const r = live(item.ruleId);
+        if (!r || r.status !== 'dormant') continue;
+        const activeCount = data.population.filter(x => x.project === project && x.status === 'active').length;
+        ruleEngine.setStatus(r, activeCount < ruleEngine.MAX_ACTIVE ? 'active' : 'candidate', 'revived by optimize');
+        r.score = 5;
+        changed.add(r.id);
+        ruleEngine.logChange({ action: 'revived', rule_id: r.id, project });
+        log(`  Revived: ${r.content.slice(0, 40)}`);
+      }
+    }
+
+    for (const a of cleanupActions) {
+      if (a.type !== 'remove' || !a.rule_id) continue;
+      const r = live(a.rule_id);
+      if (r && r.status === 'active') { ruleEngine.setStatus(r, 'dormant', `removed by cleanup: ${a.reason || ''}`.trim()); log(`  Removed: "${r.content.slice(0, 40)}"`); }
+    }
+
+    if (evaluations) {
+      for (const c of ruleEngine.applyScoresTo(data, project, evaluations)) {
+        log(`  ${c.rule_id.slice(0, 12)}: ${c.old_score} → ${c.new_score} (LLM: ${c.llm_score}) ${c.reason}`);
+      }
+    }
+    for (const p of [...promotions, ...classifications]) {
+      const r = live(p.id);
+      if (!r) continue;
+      if (r.complexity !== p.complexity) changed.add(r.id);
+      r.complexity = p.complexity;
+      r.classified = true;
+    }
+
+    if (gene === 'skillify') {
+      const mature = data.population.filter(r => r.project === project && r.status === 'active' && isMature(r));
+      if (mature.length >= 3) {
+        for (const r of mature) {
+          if (r.complexity !== 'methodology') { r.complexity = 'methodology'; r.classified = true; changed.add(r.id); }
+        }
+        log(`  Skillify: ${mature.length} mature rules → methodology`);
+      } else {
+        log(`  Skillify: only ${mature.length} mature rules (need 3+), skipping`);
+      }
+    }
+
+    // Keyword dedupe among active rules: the lower-scored duplicate goes dormant
+    const active = data.population.filter(r => r.project === project && r.status === 'active');
+    for (let i = 0; i < active.length; i++) {
+      for (let j = i + 1; j < active.length; j++) {
+        const [a, b] = [active[i], active[j]];
+        if (a.status !== 'active' || b.status !== 'active') continue;
+        const sim = ruleEngine.jaccardSimilarity(a.keywords || [], b.keywords || []);
+        if (sim <= 0.5) continue;
+        const loser = (a.score || 0) >= (b.score || 0) ? b : a;
+        const winner = loser === a ? b : a;
+        ruleEngine.setStatus(loser, 'dormant', `duplicate of ${winner.id}`);
+        res.deduped++;
+        log(`  Auto-dedup: demoted "${loser.content.slice(0, 40)}" (sim=${sim.toFixed(2)})`);
+      }
+    }
+
+    // Heuristic scoring every session (no LLM): used rules rise, unused rules decay
+    if (observations.length >= 3) res.scored = ruleEngine.scoreFromObservations(data, project, observationText);
+
+    Object.assign(res, ruleEngine.lifecycleIn(data, project));
+    return res;
+  });
+
+  for (const r of applied.promoted) changed.add(r.id);
+  if (applied.scored) log(`Heuristic-score: ${applied.scored} rules updated`);
+  if (applied.demoted.length) log(`  Demoted: ${applied.demoted.length}`);
+  if (applied.promoted.length) log(`  Promoted: ${applied.promoted.length}`);
+  if (applied.pruned.length) log(`  Pruned (archived): ${applied.pruned.length}`);
+  const rulesBorn = applied.born.filter(r => r.status === 'active' || r.status === 'candidate').length;
+
+  return {
+    memories,
+    learned: {
+      at: new Date().toISOString(), gene, complexity, sessionCount, rulesBorn,
+      conflicts: applied.conflicts, prunedCount: applied.pruned.length, changedIds: [...changed],
+      skillDemoted: applied.demoted.some(r => r.old_skill_path),
+    },
+  };
+}
+
+/** Skill files, the rules file, hints, cross-project store and session memory. */
+function solidify(pending, learned, memories, ruleEngine, claudeMdWriter, llmBrain, changed) {
+  const { project, newMemories = [], observations = [] } = pending;
+  const { gene, rulesBorn, prunedCount } = learned;
   const finalActive = ruleEngine.getActiveRules(project);
-
-  // Classify complexity for rules born/modified this session only
-  if (sessionRuleIds.size > 0) {
-    const data = ruleEngine.loadPopulation();
-    let classified = 0;
-    for (const rule of data.population) {
-      if (!sessionRuleIds.has(rule.id)) continue;
-      // Skip rules that already have a complexity field
-      if (rule.complexity) continue;
-      try {
-        rule.complexity = llmBrain.classifyComplexity(rule, finalActive, pending.projectType || '');
-        classified++;
-        log(`  Classified ${rule.id.slice(0, 12)}: ${rule.complexity}`);
-      } catch (err) {
-        rule.complexity = 'simple'; // safe fallback
-        log(`  Classify error for ${rule.id.slice(0, 12)}: ${err.message}, defaulting to simple`);
-      }
-    }
-    if (classified > 0) ruleEngine.savePopulation(data);
-  }
-
-  // Partition rules: methodology → skillWriter, others → claudeMdWriter
-  let skillWriter;
-  try { skillWriter = require('./skillWriter'); } catch { skillWriter = null; }
-
   const methodologyRules = finalActive.filter(r => r.complexity === 'methodology');
-  const otherRules = finalActive.filter(r => r.complexity !== 'methodology');
+  let skillFailed = false;
+  const skillWriter = require('./skillWriter');
 
-  // P4: Auto-learn — regenerate skill when rules change (new rules born, scores shift)
-  // A skill should always reflect the LATEST state of the methodology.
-  const shouldRegenSkill = skillWriter && methodologyRules.length > 0 && (
-    rulesAdded > 0 ||                    // New rules were born this session
-    gene === 'skillify' ||               // Skillify just promoted rules
-    gene === 'cleanup' ||                // Cleanup merged/rewrote rules
-    sessionRuleIds.size > 0              // Any rules were modified
-  );
-
-  if (skillWriter && methodologyRules.length > 0) {
-    try {
-      let allMemories = [];
-      let sessionNarratives = [];
-      try {
-        const memoryReader = require('./memoryReader');
-        allMemories = memoryReader.getAllMemories(project);
-      } catch {}
-      try {
-        const narrativePath = path.join(DATA_DIR, 'narrative.jsonl');
-        if (fs.existsSync(narrativePath)) {
+  const keepSkills = [];
+  try {
+    skillWriter.migrateFlatSkills(project);
+    if (methodologyRules.length > 0) {
+      const existing = methodologyRules.map(r => r.skill_path).find(p => p && fs.existsSync(p));
+      const groupChanged = methodologyRules.some(r => changed.has(r.id)) || learned.skillDemoted;
+      if (existing && !groupChanged) {
+        keepSkills.push(existing);
+        log('  Skill unchanged (no rule changes this session)');
+      } else {
+        let sessionNarratives = [];
+        try {
+          const narrativePath = path.join(DATA_DIR, 'narrative.jsonl');
           sessionNarratives = fs.readFileSync(narrativePath, 'utf8').trim().split('\n')
             .filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+        } catch {}
+        const result = skillWriter.writeSkill(project, methodologyRules[0], methodologyRules.slice(1), pending.projectType || '', memories, sessionNarratives);
+        if (result && result.path) keepSkills.push(result.path);
+        log(result && result.written ? `  Skill file: ${result.path}${result.reason ? ` (${result.reason})` : ''}` : `  Skill skipped: ${(result && result.reason) || 'unknown'}`);
+        if (result && result.written) {
+          const ids = new Set(methodologyRules.map(r => r.id));
+          ruleEngine.mutatePopulation(data => {
+            for (const r of data.population) if (ids.has(r.id)) r.skill_path = result.path;
+          });
         }
-      } catch {}
-
-      if (shouldRegenSkill) {
-        // Regenerate: rules changed, skill needs to reflect latest state
-        log(`  Skill auto-update: regenerating (trigger: ${rulesAdded > 0 ? 'new rules' : gene === 'skillify' ? 'promotion' : 'rule changes'})`);
-        const primary = methodologyRules[0];
-        const related = methodologyRules.slice(1);
-        const result = skillWriter.writeSkill(project, primary, related, pending.projectType || '', allMemories, sessionNarratives);
-        if (result && result.written) log(`  Skill file: ${result.path}`);
-        else if (result) log(`  Skill skipped: ${result.reason || 'unknown'}`);
-      } else {
-        log(`  Skill unchanged (no rule changes this session)`);
-      }
-      log(`Solidified: ${methodologyRules.length} methodology rules → skill`);
-    } catch (err) {
-      log(`skillWriter error: ${err.message}, falling back to claudeMdWriter`);
-      otherRules.push(...methodologyRules);
-    }
-    // Build skill routes for CLAUDE.md so Claude Code knows when to use the skill
-    const skillRoutes = [];
-    const skillDir = path.join(project, '.claude', 'skills');
-    if (fs.existsSync(skillDir)) {
-      for (const f of fs.readdirSync(skillDir).filter(f => f.startsWith('auto-') && f.endsWith('.md'))) {
-        const skillContent = fs.readFileSync(path.join(skillDir, f), 'utf8');
-        const nameMatch = skillContent.match(/name:\s*"?([^"\n]+)"?/);
-        const descMatch = skillContent.match(/description:\s*\|?\s*\n?\s*([^\n]+)/);
-        const triggerMatches = [...skillContent.matchAll(/^\s+-\s*"?([^"\n]+)"?\s*$/gm)];
-        skillRoutes.push({
-          name: f.replace('.md', ''),
-          description: (descMatch ? descMatch[1].trim() : 'Auto-generated skill'),
-          triggers: triggerMatches.slice(0, 5).map(m => m[1].trim()),
-        });
       }
     }
-    const writtenPath = claudeMdWriter.writeRulesToClaudeMd(project, otherRules, skillRoutes);
-    log(`Solidified: ${otherRules.length} rules + ${skillRoutes.length} skill routes → ${writtenPath || 'CLAUDE.md'}`);
-  } else {
-    const writtenPath = claudeMdWriter.writeRulesToClaudeMd(project, finalActive);
-    log(`Solidified: ${finalActive.length} rules → ${writtenPath || 'CLAUDE.md'}`);
+    for (const f of skillWriter.reconcileSkills(project, keepSkills)) log(`  Skill removed: ${f}`);
+  } catch (err) {
+    log(`skillWriter error: ${err.message}, rules stay in the rules file`);
+    skillFailed = true;
   }
 
-  // --- Skill hints + cross-project store (extracted to modules) ---
-  const skillHints = require('./skillHints');
-  const crossProjectStore = require('./crossProjectStore');
-  skillHints.updateHints(methodologyRules, log);
-  crossProjectStore.savePatterns(project, finalActive, (pending && pending.projectType) || 'general', log);
+  // Re-read right before writing: a concurrent processor may have changed the set meanwhile.
+  // Methodology rules whose skill exists are routed; the rest are written as rules.
+  const activeNow = ruleEngine.getActiveRules(project);
+  const otherRules = skillFailed ? activeNow
+    : activeNow.filter(r => r.complexity !== 'methodology' || !(r.skill_path && fs.existsSync(r.skill_path)));
+  const routes = skillWriter.listSkillRoutes(project);
+  const written = claudeMdWriter.writeRules(project, otherRules, routes);
+  if (written.error) log(`Rules file not written: ${written.error}`);
+  log(`Solidified: ${otherRules.length} rules + ${routes.length} skill routes → ${written.path} (${written.changed ? 'updated' : 'unchanged'})`);
+
+  // --- Skill hints + cross-project store ---
+  require('./skillHints').updateHints(methodologyRules, log);
+  require('./crossProjectStore').savePatterns(project, finalActive, pending.projectType || 'general', log);
 
   // --- Session memory ---
   try {
-    const sessionMemory = require('./sessionMemory');
-    const sessionId = sessionMemory.generateSessionId();
-
-    if (observations && observations.length >= 3) {
+    if (observations.length >= 3) {
+      const sessionMemory = require('./sessionMemory');
       const compressResult = llmBrain.compressSession(observations, newMemories, []);
       if (compressResult && compressResult.summary) {
+        const sessionId = sessionMemory.generateSessionId(pending.sessionId);
         sessionMemory.writeSession(sessionId, compressResult, observations, {
-          project, toolCalls: observations.length, strategy: gene, rulesAdded, rulesPruned: 0,
+          project, toolCalls: observations.length, strategy: gene, rulesAdded: rulesBorn, rulesPruned: prunedCount,
         });
         sessionMemory.appendIndex(sessionId,
-          compressResult.index_line || compressResult.summary.split('\n')[0].slice(0, 100),
-          observations.length, path.basename(project));
+          compressResult.index_line || String(compressResult.summary).split('\n')[0].slice(0, 100),
+          observations.length, project);
         log(`Memory: ${sessionId}`);
       }
     }
   } catch (err) { log(`Memory error: ${err.message}`); }
-
-  // --- Log ---
-  const finalStats = ruleEngine.getPopulationStats(project);
-  ruleEngine.logChange({
-    action: 'session_complete', project, gene, complexity,
-    session: sessionCount,
-    rules_born: rulesAdded, conflicts: conflictsFound,
-    population: finalStats,
-  });
-
-  try { fs.unlinkSync(pendingFile); } catch {}
-
-  log(`Done [${gene}]: session=${sessionCount} born=${rulesAdded} active=${finalStats.active} dormant=${finalStats.dormant}`);
 }
 
-main().catch(err => { log(`FATAL: ${err.stack || err.message || err}`); });
+function main() {
+  const pendingFile = process.argv[2] || PENDING_PATH;
+  if (fs.existsSync(pendingFile)) processFile(pendingFile);
+  else log(`No pending data: ${pendingFile}`);
+  try { sweepPending(pendingFile); } catch (err) { log(`Sweep failed: ${err.message}`); }
+}
+
+if (require.main === module) main();
+
+module.exports = { processPending, processFile, normalizePending, sweepPending, collectInstructionLayers, fallbackTriage };

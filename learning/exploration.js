@@ -10,17 +10,15 @@
 
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
+const { execFileSync } = require('child_process');
+const { DATA_DIR } = require('./paths');
+const { appendBounded } = require('./fsutil');
 
-const LEARNING_ROOT = path.join(__dirname);
-const DATA_DIR = path.join(LEARNING_ROOT, 'data');
 const EXPLORATION_LOG = path.join(DATA_DIR, 'exploration.jsonl');
 const NARRATIVE_LOG = path.join(DATA_DIR, 'narrative.jsonl');
 
 function log(entry) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  const line = JSON.stringify({ timestamp: new Date().toISOString(), ...entry }) + '\n';
-  fs.appendFileSync(EXPLORATION_LOG, line, 'utf8');
+  appendBounded(EXPLORATION_LOG, JSON.stringify({ timestamp: new Date().toISOString(), ...entry }), 512 * 1024);
 }
 
 /**
@@ -44,10 +42,9 @@ function findStaleRules(project) {
  */
 function getRecentGitActivity(projectPath, days) {
   try {
-    const since = `${days || 7} days ago`;
-    const log = execSync(
-      `git log --since="${since}" --oneline --no-merges -20`,
-      { cwd: projectPath, encoding: 'utf8', timeout: 10000 }
+    const since = `${Number(days) || 7} days ago`;
+    const log = execFileSync('git', ['log', `--since=${since}`, '--oneline', '--no-merges', '-20'],
+      { cwd: projectPath, encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'ignore'] }
     ).trim();
     return log || '(no recent commits)';
   } catch {
@@ -93,6 +90,15 @@ Reply JSON:
 {"drifts": [{"type": "rule_ignored|missing_rule|outdated_rule", "detail": "<what's wrong>", "rule_id": "<if applicable, empty otherwise>"}]}
 
 No drift? Reply: {"drifts": []}`, 25000);
+
+  // Every active rule was just evaluated against recent behavior
+  if (result) {
+    const ids = new Set(active.map(r => r.id));
+    const now = new Date().toISOString();
+    ruleEngine.mutatePopulation(data => {
+      for (const r of data.population) if (ids.has(r.id)) r.last_evaluated = now;
+    });
+  }
 
   return (result && result.drifts) ? result.drifts : [];
 }

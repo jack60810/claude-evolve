@@ -1,17 +1,31 @@
 #!/usr/bin/env node
-// skillWriter.js — Write/delete auto-generated skill files in .claude/skills/
-// Handles methodology-level rules that graduate into standalone skill files.
+// skillWriter.js — Write/delete auto-generated skills in .claude/skills/
+// Methodology-level rules graduate into one skill per project, in the format Claude Code
+// discovers: .claude/skills/auto-<slug>/SKILL.md with name/description frontmatter.
+//
+// Ownership: a skill carries a hash marker line right after its frontmatter. A file whose
+// content no longer matches the hash (the user edited it), or that has no marker, is never
+// overwritten or deleted. New skill dirs in a git repo are added to .git/info/exclude.
 // Zero npm dependencies — uses only Node.js built-ins.
 
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { writeFileAtomic } = require('./fsutil');
+const { ensureGitExcluded, sanitizeText } = require('./claudeMdWriter');
 
-const SKILLS_DIR = '.claude/skills';
+const SKILLS_DIR = path.join('.claude', 'skills');
 const SKILL_PREFIX = 'auto-';
+const SKILL_FILE = 'SKILL.md';
 const HASH_MARKER = 'claude-evolve:auto-skill';
+const EXCLUDE_PATTERN = '/.claude/skills/auto-*/';
 
-// ===================== Slug generation =====================
+// ===================== Slugs and paths =====================
+
+function cleanSlug(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-')
+    .replace(/^-|-$/g, '').slice(0, 50).replace(/-$/, '');
+}
 
 /**
  * Generate a URL-safe slug from rule keywords or content.
@@ -19,7 +33,6 @@ const HASH_MARKER = 'claude-evolve:auto-skill';
  * @returns {string} Slug like "bq-analysis-workflow"
  */
 function generateSlug(rule) {
-  // Prefer keywords array, fall back to extracting from content
   const words = (rule.keywords && rule.keywords.length > 0)
     ? rule.keywords.slice(0, 5)
     : (rule.content || '').toLowerCase()
@@ -29,247 +42,309 @@ function generateSlug(rule) {
         .slice(0, 5);
 
   const slug = words
-    .map(w => w.toLowerCase().replace(/[^a-z0-9]/g, ''))
+    .map(w => String(w).toLowerCase().replace(/[^a-z0-9]/g, ''))
     .filter(Boolean)
     .join('-');
 
-  return slug || ('skill-' + (rule.id || Date.now().toString(36)));
+  return slug || ('skill-' + cleanSlug(rule.id || Date.now().toString(36)));
 }
 
-// ===================== Hash computation =====================
+function skillsRoot(projectPath) {
+  return path.join(projectPath, SKILLS_DIR);
+}
 
-/**
- * Compute SHA-256 hash of content, excluding the hash line itself.
- * @param {string} content - Full file content
- * @returns {string} Hex hash
- */
+function skillFilePath(projectPath, slug) {
+  return path.join(skillsRoot(projectPath), SKILL_PREFIX + slug, SKILL_FILE);
+}
+
+/** Where a rule's skill would be by keyword slug (fallback when skill_path is unknown). */
+function findSkillFile(projectPath, rule) {
+  return skillFilePath(projectPath, generateSlug(rule));
+}
+
+function slugFromPath(skillPath) {
+  return path.basename(path.dirname(skillPath)).slice(SKILL_PREFIX.length);
+}
+
+// ===================== Hash / ownership =====================
+
+/** SHA-256 of the content without the hash marker line. */
 function computeHash(content) {
-  // Remove the first line (which contains the hash marker) before hashing
   const lines = content.split('\n');
-  const bodyLines = [];
-  let skippedMarker = false;
-  for (const line of lines) {
-    if (!skippedMarker && line.includes(HASH_MARKER)) {
-      skippedMarker = true;
-      continue;
-    }
-    bodyLines.push(line);
-  }
-  const body = bodyLines.join('\n');
-  return crypto.createHash('sha256').update(body, 'utf8').digest('hex');
+  const idx = lines.findIndex(l => l.includes(HASH_MARKER));
+  if (idx !== -1) lines.splice(idx, 1);
+  return crypto.createHash('sha256').update(lines.join('\n'), 'utf8').digest('hex');
 }
 
-/**
- * Extract stored hash from file content.
- * @param {string} content - File content
- * @returns {string|null} Stored hash or null
- */
 function extractStoredHash(content) {
   const match = content.match(/claude-evolve:auto-skill\s+hash=([a-f0-9]+)/);
   return match ? match[1] : null;
 }
 
-// ===================== Skill file path =====================
-
-/**
- * Returns the path where this rule's skill file would be/is.
- * @param {string} projectPath - Project root path
- * @param {Object} rule - Rule object
- * @returns {string} Absolute path to skill file
- */
-function findSkillFile(projectPath, rule) {
-  const slug = generateSlug(rule);
-  return path.join(projectPath, SKILLS_DIR, SKILL_PREFIX + slug + '.md');
+/** 'ours' (unedited), 'edited' (marker present, content changed) or 'foreign' (no marker). */
+function ownership(content) {
+  const stored = extractStoredHash(content);
+  if (!stored) return 'foreign';
+  return computeHash(content) === stored ? 'ours' : 'edited';
 }
 
-// ===================== Build skill content =====================
+function readOwnership(file) {
+  try { return ownership(fs.readFileSync(file, 'utf8')); } catch { return null; }
+}
+
+// ===================== Content =====================
+
+function splitFrontmatter(content) {
+  const text = content.replace(/\r\n?/g, '\n').trim();
+  const m = text.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+  if (!m) return null;
+  return { fm: m[1].split('\n'), body: m[2] };
+}
 
 /**
- * Build the markdown content for a skill file from a GROUP of related rules.
- * Merges related rules into a coherent methodology skill with proper Claude Code format.
- *
- * @param {Object} primaryRule - The main rule (highest score or first in group)
- * @param {Array} relatedRules - Other rules in the same methodology group
- * @param {string} slug - Generated slug
- * @param {string} projectType - Project type (e.g., 'analysis', 'backend')
- * @returns {string} Skill file body (everything except the hash marker line)
+ * Normalize a skill to the Claude Code format: frontmatter first with name = dir name and
+ * a description, then the hash marker line, then the body.
+ */
+function finalizeSkill(content, slug, fallbackDescription, meta) {
+  // Drop any old marker line (flat skills had it above the frontmatter)
+  const cleaned = content.split('\n').filter(l => !l.includes(HASH_MARKER)).join('\n');
+  const parts = splitFrontmatter(cleaned) || { fm: [], body: cleaned };
+  const body = parts.body.replace(/^\n+/, '');
+  const fm = parts.fm.filter(l => !/^name\s*:/.test(l));
+  fm.unshift(`name: ${SKILL_PREFIX}${slug}`);
+  if (!fm.some(l => /^description\s*:/.test(l))) {
+    fm.splice(1, 0, `description: ${sanitizeText(fallbackDescription, true)}`);
+  }
+
+  const marker = (hash) => `<!-- ${HASH_MARKER} hash=${hash} project-type=${meta.projectType || 'unknown'} created=${meta.created} -->`;
+  const assemble = (hash) => ['---', ...fm, '---', marker(hash), body.trimEnd(), ''].join('\n');
+  return assemble(computeHash(assemble('')));
+}
+
+function describeRules(allRules) {
+  const keywords = [...new Set(allRules.flatMap(r => r.keywords || []))];
+  const domainTerms = keywords.filter(k => k.length > 2).slice(0, 4).join(', ');
+  return { keywords, domainTerms };
+}
+
+/**
+ * Template skill (used when the LLM fails). Returns full content with frontmatter.
  */
 function buildSkillBody(primaryRule, relatedRules, slug, projectType) {
   const allRules = [primaryRule, ...(relatedRules || [])];
-  const allKeywords = [...new Set(allRules.flatMap(r => r.keywords || []))];
-
-  // Build a one-line description from the combined keywords
-  const domainTerms = allKeywords.filter(k => k.length > 2).slice(0, 4).join(', ');
-  const description = `${domainTerms} workflow — auto-learned from ${allRules.length} observed patterns`;
-
-  // Build trigger phrases from keywords
-  const triggers = allKeywords
-    .filter(k => k.length > 2 && !/^[A-Z]/.test(k))
-    .slice(0, 5);
+  const { domainTerms } = describeRules(allRules);
+  const description = `${domainTerms} workflow, auto-learned from ${allRules.length} observed patterns. Use when working on ${projectType || 'this type of'} tasks.`;
 
   const lines = [
     '---',
     `name: ${SKILL_PREFIX}${slug}`,
-    `description: |`,
-    `  ${description}.`,
-    `  Auto-generated by claude-evolve from observed session patterns.`,
-    `  Invoke when working on ${projectType || 'this type of'} tasks.`,
+    `description: ${sanitizeText(description, true)}`,
+    '---',
+    '',
+    `# ${domainTerms} Methodology`,
+    '',
+    `Auto-learned from ${primaryRule.sessions_evaluated || '?'} sessions of ${projectType || 'project'} work.`,
+    'This skill encodes patterns that were consistently followed and proved useful over time.',
+    '',
+    '## Steps',
+    '',
   ];
-
-  // Add triggers if we have meaningful ones
-  if (triggers.length >= 2) {
-    lines.push('triggers:');
-    for (const t of triggers) {
-      lines.push(`  - ${t}`);
-    }
-  }
-
-  lines.push('---');
-  lines.push('');
-
-  // Methodology description
-  lines.push(`# ${domainTerms} Methodology`);
-  lines.push('');
-  lines.push(`Auto-learned from ${primaryRule.sessions_evaluated || '?'} sessions of ${projectType || 'project'} work.`);
-  lines.push(`This skill encodes patterns that were consistently followed and proved useful over time.`);
-  lines.push('');
-
-  // Steps: each rule becomes a numbered step
-  lines.push('## Steps');
-  lines.push('');
   allRules.forEach((rule, i) => {
-    const content = (rule.content || '').trim().replace(/^[-*]\s*/, '');
-    lines.push(`${i + 1}. ${content}`);
+    lines.push(`${i + 1}. ${sanitizeText(rule.content, true).replace(/^[-*]\s*/, '')}`);
   });
   lines.push('');
-
-  // Source information
   lines.push('## About this skill');
   lines.push('');
-  lines.push('This skill was automatically generated by [claude-evolve](https://github.com/jack60810/claude-evolve).');
-  lines.push(`It observed ${primaryRule.sessions_evaluated || '?'} sessions and found these ${allRules.length} patterns consistently applied.`);
-  lines.push('Rules with score < 3 will be automatically demoted, and this skill file will be deleted.');
-  lines.push('');
-  lines.push('You can edit this file freely. claude-evolve will detect your edits (via content hash) and stop overwriting.');
-
+  lines.push('Generated by [claude-evolve](https://github.com/jack60810/claude-evolve). If you edit this file, claude-evolve detects the edit (content hash) and stops overwriting or deleting it.');
   return lines.join('\n') + '\n';
 }
 
 // ===================== Write skill =====================
 
+function ensureExcluded(projectPath, file) {
+  ensureGitExcluded(projectPath, path.relative(projectPath, file), EXCLUDE_PATTERN);
+}
+
 /**
- * Write a SINGLE skill file for a METHODOLOGY GROUP of related rules.
- * Uses Claude Code (via llmBrain) to generate the skill content — Claude natively
- * understands the skill format and produces much better output than templates.
+ * Write the ONE skill for a project's methodology group.
+ * Keeps the slug of an existing skill (no rename churn); a changed slug removes the old dir.
+ * Sets skill_path on the passed rule objects; the caller persists it.
  *
- * @param {string} projectPath - Project root path
- * @param {Object} primaryRule - The primary rule in the group
- * @param {Array} relatedRules - Other rules in the same methodology group
- * @param {string} projectType - Project type (e.g., 'analysis')
- * @param {Array} [memories] - User memories for thinking pattern inference
- * @param {Array} [sessionNarratives] - Session narratives for context
  * @returns {{ written: boolean, path: string, reason?: string }}
  */
 function writeSkill(projectPath, primaryRule, relatedRules, projectType, memories, sessionNarratives) {
   const allRules = [primaryRule, ...(relatedRules || [])];
-  const combinedKeywords = [...new Set(allRules.flatMap(r => r.keywords || []))];
-  const fallbackSlug = generateSlug({ keywords: combinedKeywords, id: primaryRule.id });
+  // Never create a project root that no longer exists (deleted worktree or workspace)
+  if (!fs.existsSync(projectPath)) return { written: false, path: '', reason: 'project root does not exist' };
+  migrateFlatSkills(projectPath);
 
-  // Ensure directory exists
-  const skillDir = path.join(projectPath, SKILLS_DIR);
-  fs.mkdirSync(skillDir, { recursive: true });
+  const existing = allRules.map(r => r.skill_path).find(p => p && fs.existsSync(p)) || null;
+  if (existing && readOwnership(existing) !== 'ours') {
+    return { written: false, path: existing, reason: 'user-edited' };
+  }
 
-  // Call Claude Code to generate the skill content (with memories for thinking-pattern inference)
+  const { keywords } = describeRules(allRules);
+  const fallbackSlug = generateSlug({ keywords, id: primaryRule.id });
+
   const llmBrain = require('./llmBrain');
   const result = llmBrain.generateSkillContent(allRules, projectType, fallbackSlug, memories, sessionNarratives);
 
-  // Fix 5: Extract name from LLM-generated content for a better slug
-  let slug = fallbackSlug;
-  if (result && result.content) {
-    const nameMatch = result.content.match(/name:\s*"?auto-([^"\n]+)"?/);
-    if (nameMatch) slug = nameMatch[1].trim().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-');
+  let slug = existing ? slugFromPath(existing) : fallbackSlug;
+  if (!existing && result && result.content) {
+    const nameMatch = result.content.match(/^name:\s*"?auto-([^"\n]+)"?\s*$/m);
+    if (nameMatch && cleanSlug(nameMatch[1])) slug = cleanSlug(nameMatch[1]);
   }
 
-  const skillPath = path.join(skillDir, SKILL_PREFIX + slug + '.md');
-
-  // Check if file already exists and user has edited it
-  // Also check old slug path (in case LLM changed the name)
-  const oldPath = path.join(skillDir, SKILL_PREFIX + fallbackSlug + '.md');
-  for (const checkPath of [skillPath, oldPath]) {
-    if (fs.existsSync(checkPath)) {
-      const existing = fs.readFileSync(checkPath, 'utf8');
-      const storedHash = extractStoredHash(existing);
-      if (storedHash) {
-        const existingBody = existing.split('\n').slice(1).join('\n');
-        const existingBodyHash = crypto.createHash('sha256').update(existingBody, 'utf8').digest('hex');
-        if (storedHash !== existingBodyHash) {
-          return { written: false, path: checkPath, reason: 'user-edited' };
-        }
-      }
-      // Clean up old slug file if name changed
-      if (checkPath === oldPath && checkPath !== skillPath) {
-        try { fs.unlinkSync(oldPath); } catch {}
-      }
-      break;
-    }
+  const file = skillFilePath(projectPath, slug);
+  if (file !== existing && fs.existsSync(file) && readOwnership(file) !== 'ours') {
+    return { written: false, path: file, reason: 'user-edited' };
   }
 
-  if (!result || !result.content) {
-    // LLM failed — fall back to basic template
-    const body = buildSkillBody(primaryRule, relatedRules, slug, projectType);
-    const hash = crypto.createHash('sha256').update(body, 'utf8').digest('hex');
-    const created = primaryRule.created || new Date().toISOString().slice(0, 10);
-    const fullContent = `<!-- ${HASH_MARKER} hash=${hash} project-type=${projectType || 'unknown'} created=${created} -->\n${body}`;
-    const tmp = skillPath + '.tmp';
-    fs.writeFileSync(tmp, fullContent, 'utf8');
-    fs.renameSync(tmp, skillPath);
-    return { written: true, path: skillPath, reason: 'template-fallback' };
-  }
-
-  // Add hash marker for user-edit detection
-  const body = result.content;
-  const hash = crypto.createHash('sha256').update(body, 'utf8').digest('hex');
   const created = primaryRule.created || new Date().toISOString().slice(0, 10);
-  const fullContent = `<!-- ${HASH_MARKER} hash=${hash} project-type=${projectType || 'unknown'} created=${created} -->\n${body}`;
+  const { domainTerms } = describeRules(allRules);
+  const fallbackDescription = `${domainTerms} workflow auto-learned from ${allRules.length} observed patterns`;
+  const source = (result && result.content) ? result.content : buildSkillBody(primaryRule, relatedRules, slug, projectType);
+  const content = finalizeSkill(source, slug, fallbackDescription, { projectType, created });
 
-  // Atomic write
-  const tmp = skillPath + '.tmp';
-  fs.writeFileSync(tmp, fullContent, 'utf8');
-  fs.renameSync(tmp, skillPath);
+  const isNew = !fs.existsSync(file);
+  writeFileAtomic(file, content);
+  if (isNew) ensureExcluded(projectPath, file);
+  if (existing && existing !== file) removeSkillFile(existing);
 
-  return { written: true, path: skillPath };
+  for (const r of allRules) r.skill_path = file;
+  return { written: true, path: file, reason: (result && result.content) ? undefined : 'template-fallback' };
 }
 
-// ===================== Delete skill =====================
+// ===================== Delete / reconcile =====================
+
+function removeSkillFile(file) {
+  try { fs.unlinkSync(file); } catch {}
+  const dir = path.dirname(file);
+  try { if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir); } catch {}
+}
 
 /**
- * Delete the skill file for a rule.
- * No error if file is already gone.
- *
- * @param {string} projectPath - Project root path
- * @param {Object} rule - Rule object with skill_path or keywords for lookup
- * @returns {{ deleted: boolean, path: string }}
+ * Delete a rule's skill. Files the user edited (or never ours) are kept.
+ * @returns {{ deleted: boolean, path: string, reason?: string }}
  */
 function deleteSkill(projectPath, rule) {
   const skillPath = rule.skill_path || findSkillFile(projectPath, rule);
+  if (!fs.existsSync(skillPath)) return { deleted: false, path: skillPath };
+  if (readOwnership(skillPath) !== 'ours') return { deleted: false, path: skillPath, reason: 'user-edited' };
+  removeSkillFile(skillPath);
+  return { deleted: true, path: skillPath };
+}
 
-  if (fs.existsSync(skillPath)) {
-    fs.unlinkSync(skillPath);
-    const msg = `[skillWriter] Deleted skill file: ${skillPath}`;
-    if (typeof console !== 'undefined') console.log(msg);
-    return { deleted: true, path: skillPath };
+function listAutoSkillFiles(projectPath) {
+  const root = skillsRoot(projectPath);
+  let entries = [];
+  try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return []; }
+  return entries
+    .filter(e => e.isDirectory() && e.name.startsWith(SKILL_PREFIX))
+    .map(e => path.join(root, e.name, SKILL_FILE))
+    .filter(f => fs.existsSync(f));
+}
+
+/**
+ * Delete every unedited auto skill not in keepPaths (renamed, demoted or orphaned).
+ * @returns {string[]} deleted paths
+ */
+function reconcileSkills(projectPath, keepPaths) {
+  const keep = new Set(keepPaths || []);
+  const deleted = [];
+  for (const file of listAutoSkillFiles(projectPath)) {
+    if (keep.has(file) || readOwnership(file) !== 'ours') continue;
+    removeSkillFile(file);
+    deleted.push(file);
   }
+  return deleted;
+}
 
-  return { deleted: false, path: skillPath };
+/**
+ * Move old flat skills (.claude/skills/auto-*.md) into auto-<slug>/SKILL.md.
+ * Unedited files are re-stamped (still ours); edited ones move as-is without a marker (user-owned).
+ * @returns {string[]} new paths
+ */
+function migrateFlatSkills(projectPath) {
+  const root = skillsRoot(projectPath);
+  let names = [];
+  try { names = fs.readdirSync(root).filter(f => f.startsWith(SKILL_PREFIX) && f.endsWith('.md')); } catch { return []; }
+  const moved = [];
+  for (const name of names) {
+    const flat = path.join(root, name);
+    try {
+      if (!fs.statSync(flat).isFile()) continue;
+      const content = fs.readFileSync(flat, 'utf8');
+      const own = ownership(content);
+      const slug = cleanSlug(name.slice(SKILL_PREFIX.length, -3)) || 'skill';
+      const file = skillFilePath(projectPath, slug);
+      let movedNow = false;
+      if (!fs.existsSync(file)) {
+        const created = (content.match(/created=(\S+)/) || [])[1] || new Date().toISOString().slice(0, 10);
+        const projectType = (content.match(/project-type=(\S+)/) || [])[1];
+        const next = own === 'ours'
+          ? finalizeSkill(content, slug, `${slug.replace(/-/g, ' ')} workflow`, { projectType, created })
+          : content.split('\n').filter(l => !l.includes(HASH_MARKER)).join('\n');
+        writeFileAtomic(file, next);
+        ensureExcluded(projectPath, file);
+        moved.push(file);
+        movedNow = true;
+      }
+      // Keep a flat file the user edited when its new location is already taken
+      if (movedNow || own === 'ours') fs.unlinkSync(flat);
+    } catch {}
+  }
+  return moved;
+}
+
+function parseFrontmatterFields(content) {
+  const parts = splitFrontmatter(content);
+  if (!parts) return {};
+  const out = { triggers: [] };
+  let key = null;
+  for (const line of parts.fm) {
+    const kv = line.match(/^([A-Za-z_-]+)\s*:\s*(.*)$/);
+    if (kv) {
+      key = kv[1];
+      const v = kv[2].trim().replace(/^["']|["']$/g, '');
+      if (key === 'name') out.name = v;
+      else if (key === 'description' && v && v !== '|' && v !== '>') out.description = v;
+      continue;
+    }
+    const item = line.match(/^\s+-\s*"?([^"]+?)"?\s*$/);
+    if (item && key === 'triggers') { out.triggers.push(item[1]); continue; }
+    if (key === 'description' && !out.description && line.trim()) out.description = line.trim();
+  }
+  return out;
+}
+
+/** Routes for the rules file: only auto skills that exist on disk. */
+function listSkillRoutes(projectPath) {
+  return listAutoSkillFiles(projectPath).map(file => {
+    const f = parseFrontmatterFields(fs.readFileSync(file, 'utf8'));
+    const dirName = path.basename(path.dirname(file));
+    return {
+      name: dirName,
+      path: path.relative(projectPath, file).split(path.sep).join('/'),
+      description: f.description || 'Auto-generated skill',
+      triggers: (f.triggers || []).slice(0, 5),
+    };
+  });
 }
 
 module.exports = {
   writeSkill,
   deleteSkill,
+  reconcileSkills,
+  migrateFlatSkills,
+  listSkillRoutes,
   findSkillFile,
+  skillFilePath,
   // Exported for testing
   generateSlug,
   computeHash,
   extractStoredHash,
+  ownership,
   buildSkillBody,
+  EXCLUDE_PATTERN,
 };

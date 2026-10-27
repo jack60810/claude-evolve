@@ -9,6 +9,9 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 
+// Isolate every data write (rules.json, changelog, caches) from learning/data
+process.env.CLAUDE_EVOLVE_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ce-data-'));
+
 // =====================================================================
 // Helpers
 // =====================================================================
@@ -279,12 +282,13 @@ describe('claudeMdWriter.buildManagedSection', () => {
     };
   }
 
-  it('renders simple rule as single-line bullet with complexity attribute', () => {
+  it('renders simple rule as single-line bullet with an id-only tag', () => {
     const rules = [makeRule('r_simple', 'simple', 'Always Read before Edit')];
     const section = claudeMdWriter.buildManagedSection(rules);
 
-    // Should contain the rule tag with complexity=simple
-    assert.ok(section.includes('complexity=simple'), 'Tag should include complexity=simple');
+    // The tag holds only the id; score and other metadata stay in rules.json
+    assert.ok(section.includes('<!-- claude-evolve:rule id=r_simple -->'), 'Tag should hold the id');
+    assert.ok(!section.includes('score='), 'Tag should not carry the score');
     // Should contain the bullet-formatted rule
     assert.ok(section.includes('- Always Read before Edit'), 'Simple rule should be a bullet');
     // Should be wrapped in managed markers
@@ -297,7 +301,7 @@ describe('claudeMdWriter.buildManagedSection', () => {
     const rules = [makeRule('r_compound', 'compound', content)];
     const section = claudeMdWriter.buildManagedSection(rules);
 
-    assert.ok(section.includes('complexity=compound'), 'Tag should include complexity=compound');
+    assert.ok(section.includes('<!-- claude-evolve:rule id=r_compound -->'));
     assert.ok(section.includes('- Dry-run BQ queries first'));
     assert.ok(section.includes('- Filter by partition column'));
     assert.ok(section.includes('- Confirm time range with user'));
@@ -308,7 +312,7 @@ describe('claudeMdWriter.buildManagedSection', () => {
     const rules = [makeRule('r_workflow', 'workflow', content)];
     const section = claudeMdWriter.buildManagedSection(rules);
 
-    assert.ok(section.includes('complexity=workflow'), 'Tag should include complexity=workflow');
+    assert.ok(section.includes('<!-- claude-evolve:rule id=r_workflow -->'));
     assert.ok(section.includes('## BQ Analysis Workflow'), 'Header should be preserved');
     assert.ok(section.includes('1. Define the analysis base'));
     assert.ok(section.includes('5. Sanity check'));
@@ -322,10 +326,13 @@ describe('claudeMdWriter.buildManagedSection', () => {
     ];
     const section = claudeMdWriter.buildManagedSection(rules);
 
-    // All three complexity types present
-    assert.ok(section.includes('complexity=simple'));
-    assert.ok(section.includes('complexity=compound'));
-    assert.ok(section.includes('complexity=workflow'));
+    // All three rules present
+    assert.ok(section.includes('id=r_s -->'));
+    assert.ok(section.includes('id=r_c -->'));
+    assert.ok(section.includes('id=r_w -->'));
+    // The heading lives inside the managed block
+    assert.equal(section.split('## Auto-learned Rules').length - 1, 1, 'Exactly one heading');
+    assert.ok(section.indexOf('## Auto-learned Rules') > section.indexOf(claudeMdWriter.MANAGED_START));
 
     // Only one managed start/end pair
     const startCount = section.split(claudeMdWriter.MANAGED_START).length - 1;
@@ -390,8 +397,12 @@ describe('skillWriter', () => {
 
     assert.ok(result.written, 'Should report written=true');
     assert.ok(fs.existsSync(result.path), 'Skill file should exist');
+    // Claude Code format: .claude/skills/auto-<slug>/SKILL.md, frontmatter first
+    assert.equal(path.basename(result.path), 'SKILL.md');
+    assert.equal(path.basename(path.dirname(result.path)), 'auto-test-skill');
 
     const content = fs.readFileSync(result.path, 'utf8');
+    assert.ok(content.startsWith('---\nname: auto-test-skill\n'), 'Frontmatter must come first, name = dir');
     assert.ok(content.includes('claude-evolve:auto-skill'), 'Should have hash marker');
     assert.ok(content.includes('hash='), 'Should have hash value');
     // Skill content is LLM-generated, check structural properties not exact content
@@ -503,108 +514,53 @@ describe('ruleEngine schema', () => {
   });
 
   it('existing rule without complexity defaults to "simple" on load', () => {
-    // Create a rules.json without complexity field (simulating old data)
-    const dataDir = path.join(tmpDir, 'data');
-    fs.mkdirSync(dataDir, { recursive: true });
-
-    const oldFormatData = {
+    const rulesPath = path.join(process.env.CLAUDE_EVOLVE_DATA_DIR, 'rules.json');
+    fs.writeFileSync(rulesPath, JSON.stringify({
       version: 2,
       session_count: 5,
       population: [{
-        id: 'r_old1',
-        project: tmpDir,
-        content: 'Always dry-run before BQ query',
-        source: 'correction',
-        keywords: ['dry-run', 'bq', 'query'],
-        score: 7,
-        relevance_count: 3,
-        sessions_evaluated: 3,
-        created: '2026-01-01',
-        status: 'active',
-        dormant_since_session: 0,
+        id: 'r_old1', project: tmpDir, content: 'Always dry-run before BQ query', source: 'correction',
+        keywords: ['dry-run', 'bq', 'query'], score: 7, relevance_count: 3, sessions_evaluated: 3,
+        created: '2026-01-01', status: 'active', dormant_since_session: 0,
         // NOTE: no 'complexity' field — this is the old format
       }],
-    };
-    const rulesPath = path.join(dataDir, 'rules.json');
-    fs.writeFileSync(rulesPath, JSON.stringify(oldFormatData), 'utf8');
+    }), 'utf8');
 
-    // Now use a fresh ruleEngine with patched path
-    // Since we can't easily change the module's DATA_DIR, we test the
-    // loadPopulation migration logic directly by reading what it does.
-    // The migration code in loadPopulation (line 96-99) backfills complexity.
-    const loaded = JSON.parse(fs.readFileSync(rulesPath, 'utf8'));
-    // Simulate the migration that loadPopulation does:
-    for (const rule of loaded.population || []) {
-      if (!rule.complexity) rule.complexity = 'simple';
-      if (!('content_hash' in rule)) rule.content_hash = null;
-      if (!('skill_path' in rule)) rule.skill_path = null;
-    }
-
+    const loaded = require('../learning/ruleEngine').loadPopulation();
     assert.equal(loaded.population[0].complexity, 'simple',
       'Rule without complexity should default to "simple"');
     assert.equal(loaded.population[0].content_hash, null,
       'Missing content_hash should default to null');
     assert.equal(loaded.population[0].skill_path, null,
       'Missing skill_path should default to null');
+    fs.unlinkSync(rulesPath);
   });
 
   it('addRule with complexity parameter stores complexity field', () => {
-    // We need to test addRule in an isolated environment.
-    // Redirect DATA_DIR by using a wrapper that saves/restores the file.
     const ruleEngineMod = require('../learning/ruleEngine');
-    const dataDir = path.join(__dirname, '..', 'learning', 'data');
+    const rulesFile = path.join(process.env.CLAUDE_EVOLVE_DATA_DIR, 'rules.json');
+    fs.writeFileSync(rulesFile, JSON.stringify({ version: 3, session_count: 0, population: [] }), 'utf8');
 
-    // Read existing rules to restore later
-    let existingRules = null;
-    let existingChangelog = null;
-    const rulesFile = path.join(dataDir, 'rules.json');
-    const changelogFile = path.join(dataDir, 'changelog.jsonl');
-    try { existingRules = fs.readFileSync(rulesFile, 'utf8'); } catch {}
-    try { existingChangelog = fs.readFileSync(changelogFile, 'utf8'); } catch {}
+    // Add a rule WITH complexity
+    const rule = ruleEngineMod.addRule(
+      tmpDir, // project
+      'When doing BQ analysis: dry_run first, filter by partition',
+      'correction',
+      ['bq', 'analysis', 'dry_run'],
+      'active',
+      'compound'
+    );
 
-    try {
-      // Start with empty population
-      fs.mkdirSync(dataDir, { recursive: true });
-      fs.writeFileSync(rulesFile, JSON.stringify({ version: 2, session_count: 0, population: [] }), 'utf8');
+    assert.equal(rule.complexity, 'compound', 'Rule should have complexity=compound');
+    assert.equal(rule.classified, true, 'An explicit complexity counts as classified');
+    assert.equal(rule.status, 'active');
+    assert.ok(rule.content_hash, 'Should have a content hash');
+    assert.equal(rule.skill_path, null, 'skill_path should be null initially');
 
-      // Add a rule WITH complexity
-      const rule = ruleEngineMod.addRule(
-        tmpDir, // project
-        'When doing BQ analysis: dry_run first, filter by partition',
-        'correction',
-        ['bq', 'analysis', 'dry_run'],
-        'active',
-        'compound'
-      );
-
-      assert.equal(rule.complexity, 'compound', 'Rule should have complexity=compound');
-      assert.equal(rule.status, 'active');
-      assert.ok(rule.content_hash, 'Should have a content hash');
-      assert.equal(rule.skill_path, null, 'skill_path should be null initially');
-
-      // Add a rule WITHOUT complexity — should default to 'simple'
-      const rule2 = ruleEngineMod.addRule(
-        tmpDir,
-        'Always Read before Edit',
-        'correction',
-        ['read', 'edit'],
-        'active'
-        // no complexity parameter
-      );
-
-      assert.equal(rule2.complexity, 'simple', 'Rule without complexity should default to "simple"');
-    } finally {
-      // Restore original files
-      if (existingRules !== null) {
-        fs.writeFileSync(rulesFile, existingRules, 'utf8');
-      } else {
-        try { fs.unlinkSync(rulesFile); } catch {}
-      }
-      if (existingChangelog !== null) {
-        fs.writeFileSync(changelogFile, existingChangelog, 'utf8');
-      } else {
-        try { fs.unlinkSync(changelogFile); } catch {}
-      }
-    }
+    // Add a rule WITHOUT complexity — defaults to 'simple' and is queued for LLM classification
+    const rule2 = ruleEngineMod.addRule(tmpDir, 'Always Read before Edit', 'correction', ['read', 'edit'], 'active');
+    assert.equal(rule2.complexity, 'simple', 'Rule without complexity should default to "simple"');
+    assert.equal(rule2.classified, false, 'Rule without complexity is not yet classified');
+    fs.unlinkSync(rulesFile);
   });
 });

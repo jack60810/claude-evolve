@@ -8,6 +8,9 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
+// Isolate every data write from learning/data
+process.env.CLAUDE_EVOLVE_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ce-data-'));
+
 // =====================================================================
 // Helpers
 // =====================================================================
