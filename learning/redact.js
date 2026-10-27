@@ -17,7 +17,14 @@ const TOKEN_PATTERNS = [
   /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
   /\bxox[abprs]-[A-Za-z0-9-]{10,}/g,
   /\bAIza[0-9A-Za-z_-]{35}/g,
+  /\bya29\.[A-Za-z0-9_-]{20,}/g,
+  /\bglpat-[A-Za-z0-9_-]{20,}/g,
+  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g,
+  /https:\/\/hooks\.slack\.com\/(?:services|workflows|triggers)\/[A-Za-z0-9\/_-]+/g,
 ];
+
+// "scheme://user:password@host": keep the user, drop the password.
+const URL_PASSWORD = /\b([a-z][a-z0-9+.-]*:\/\/[^\s:@\/]+:)[^\s@\/]+@/gi;
 
 // "Bearer <token>": keep the scheme, drop the token. Tokens must contain a digit so
 // prose such as "Bearer authentication" stays.
@@ -52,6 +59,7 @@ function redact(text) {
   let out = text;
   for (const re of TOKEN_PATTERNS) out = out.replace(re, R);
   out = out.replace(BEARER, `$1${R}`);
+  out = out.replace(URL_PASSWORD, `$1${R}@`);
   out = out.replace(KV_QUOTED, (m, q1, key, sep, q2, value) =>
     (!SENSITIVE_KEY.test(key) || keepValue(value)) ? m : `${q1}${key}${q1}${sep}${q2}${R}${q2}`);
   out = out.replace(KV_EQUALS, redactKv);

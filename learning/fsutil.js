@@ -11,13 +11,14 @@
 const fs = require('fs');
 const path = require('path');
 
-function writeFileAtomic(file, data) {
+// mode applies to the temp file, so a private file is never readable by others, even briefly.
+function writeFileAtomic(file, data, { mode } = {}) {
   let target = file;
   try { target = fs.realpathSync(file); } catch {}
   fs.mkdirSync(path.dirname(target), { recursive: true });
   const tmp = `${target}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
   try {
-    fs.writeFileSync(tmp, data, 'utf8');
+    fs.writeFileSync(tmp, data, mode ? { encoding: 'utf8', mode } : 'utf8');
     fs.renameSync(tmp, target);
   } catch (e) {
     try { fs.unlinkSync(tmp); } catch {}

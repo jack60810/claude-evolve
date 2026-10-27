@@ -80,12 +80,13 @@ What it reads on your machine:
 - Every tool call in a session. That's the tool name, the input (cut at 2,000 characters) and the output (cut at 4,000).
 - Your Claude Code memories for the project, from `~/.claude/projects/<project>/memory`. New feedback memories are the source of corrections.
 - Your instruction files: CLAUDE.md and CLAUDE.local.md from the project folder up to `/`, and `~/.claude/CLAUDE.md`. They feed the contradiction check.
+- Only when you run `eval/events.js`: your Claude Code transcripts in `~/.claude/projects`. Nothing from them is sent anywhere.
 
 What it sends:
 
 - Short excerpts of the session's tool calls go to Anthropic through `claude --print`, under your own login. So do the project's rules, your memories and your instruction text.
 - Each call runs with tools off, in an empty temp folder. With `--safe-mode`, the child sees no CLAUDE.md, skills, plugins, hooks or MCP servers. It uses that flag when your CLI has it, and `--strict-mcp-config` when it doesn't. It also sets `CLAUDE_EVOLVE_CHILD=1`, so these runs are not recorded.
-- Tool calls are redacted before they reach disk. `learning/redact.js` replaces private keys, `sk-` API keys, and GitHub, AWS, Slack, Notion and Google tokens. It also replaces Bearer tokens and values stored under names like token, secret, password, api key or authorization. It's pattern matching, so an unusual secret can slip through. Instruction files and memories that existed before the session are sent as written, so keep secrets out of them.
+- Tool calls are redacted before they reach disk. `learning/redact.js` replaces private keys, `sk-` API keys, JWTs, and GitHub, GitLab, AWS, Slack, Notion and Google tokens. It also replaces Slack webhook URLs, passwords inside URLs, Bearer tokens and values stored under names like token, secret, password, api key or authorization. It's pattern matching, so an unusual secret can slip through. Instruction files and memories that existed before the session are sent as written, so keep secrets out of them.
 
 What it writes:
 
@@ -281,6 +282,18 @@ Skip it if you use Claude Code about once a week, or your sessions are short (un
 
 Expect little from the first few sessions. A skill needs at least 5 sessions behind each of 3 rules, so it takes a while.
 
+## Is it helping?
+
+The rule store scores its own rules, so it can't tell you whether they work. `eval/events.js` reads your raw transcripts instead. For each session it counts the messages you typed, the ones that look like corrections, interrupts, tool calls you rejected, permission denials and tool errors. A forked or resumed session repeats its parent's lines, and each line is counted once.
+
+```bash
+node eval/events.js               # writes events.jsonl and sessions.jsonl to learning/data/eval
+node eval/events.js --sample 100  # a blind sheet of 100 of your messages to label y or n
+node eval/events.js --score       # how often the correction flag is right, and what it misses
+```
+
+The correction flag is a keyword match, so label a sheet before you trust it. Half the sheet comes from flagged messages and half from the rest, and the sheet doesn't say which. Everything stays in the data folder with mode 0600. Text goes through the same redaction as tool calls, so the same limits apply. Claude Code deletes transcripts after 30 days by default. For a longer history, set `"cleanupPeriodDays"` in `~/.claude/settings.json`.
+
 ## How it works
 
 ```
@@ -375,6 +388,8 @@ This runs `node --test test/*.test.js`. The tests mock the `claude` CLI and use 
 ```
 setup.js                   install, check, remove, clean-stale
 demo.js                    the demo above
+eval/
+└── events.js              outcome events from raw transcripts, labeling sheet, scoring
 learning/
 ├── hooks/
 │   ├── session-start.js   sweep abandoned sessions, inject context

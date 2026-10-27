@@ -202,6 +202,16 @@ describe('hooks', () => {
     for (const plain of ['const token = getToken();', 'Bearer authentication', 'num_tokens=12', 'secret_sauce', 'sk-learn']) {
       assert.equal(redact(plain), plain);
     }
+    for (const [input, leaked] of [
+      ['postgres://app:s3cretPass@db:5432/x', 's3cretPass'],
+      ['jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N', 'dozjgNryP4J3'],
+      ['https://hooks.slack.com/services/T000/B000/XXXXXXXXXXXXXXXX', 'XXXXXXXXXXXXXXXX'],
+      ['ya29.a0AfH6SMBxyzxyzxyzxyzxyzxyz', 'a0AfH6SMB'],
+      ['glpat-abcdefghijklmnopqrst', 'abcdefghijklmnop'],
+    ]) {
+      assert.ok(!redact(input).includes(leaked), input);
+    }
+    assert.equal(redact('https://github.com/a/b and user@example.com'), 'https://github.com/a/b and user@example.com');
   });
 
   it('keeps two concurrent sessions apart', async () => {
